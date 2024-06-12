@@ -175,7 +175,7 @@ class Mamba2Mixer(nn.Module):
             self.intermediate_size, eps=1e-5, norm_before_gate=True
         )
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, initial_states=None):
         seq_len = hidden_states.shape[1]
 
         # todo: annotate and understand
@@ -196,21 +196,22 @@ class Mamba2Mixer(nn.Module):
             xBC, [self.intermediate_size, self.ssm_state_size, self.ssm_state_size], dim=-1
         )
 
-        y = mamba_chunk_scan_combined(
+        y, last_state = mamba_chunk_scan_combined(
             x=rearrange(x, "b l (h p) -> b l h p", p=self.head_dim),
             dt=dt,
             A=A,
-            B=rearrange(B, "b l (g n) -> b l g n", g=1),
-            C=rearrange(C, "b l (g n) -> b l g n", g=1),
+            B=rearrange(B, "b l n -> b l 1 n"),
+            C=rearrange(C, "b l n -> b l 1 n"),
             chunk_size=self.chunk_size,
             D=self.D,
             z=None,
+            initial_states=initial_states,
             dt_bias=self.dt_bias,
             dt_softplus=True,
             seq_idx=None,
             dt_min=self.dt_min,
             dt_max=self.dt_max,
-            return_final_states=False
+            return_final_states=True
         )
         y = rearrange(y, "b l h p -> b l (h p)")
         y = self.gate_norm(y, z=z)
@@ -218,7 +219,7 @@ class Mamba2Mixer(nn.Module):
             y = torch.cat([self.act(z0) * x0, y], dim=-1)
 
         hidden_states = self.out_proj(y)
-        return hidden_states
+        return hidden_states, last_state
 
 
 class Mamba2RMSNorm(nn.Module):
