@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 from einops import rearrange, reduce, repeat
 
@@ -140,7 +141,7 @@ class Mamba2Mixer(nn.Module):
         self.use_bias = config.use_bias
         self.use_conv_bias = config.use_conv_bias
 
-        conv1d_dim = self.intermediate_size + 2 * config.num_heads * self.ssm_state_size
+        conv1d_dim = self.intermediate_size + 2 * self.ssm_state_size
         self.conv1d = nn.Conv1d(
             in_channels=conv1d_dim,
             out_channels=conv1d_dim,
@@ -164,7 +165,7 @@ class Mamba2Mixer(nn.Module):
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
 
         # scalar initialization of A, i.e. 1-Semi-Separable Matrix of A (== 1-SS(a))
-        A = torch.empty(self.nheads, dtype=torch.float32).uniform_(*config.A_init_range)
+        A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(*config.A_initializer_range)
         self.A_log = nn.Parameter(torch.log(A))
 
         self.D = nn.Parameter(torch.ones(self.intermediate_size))
@@ -222,9 +223,11 @@ class Mamba2Mixer(nn.Module):
         return Y, final_state
 
     def forward(self, hidden_states):
+        bsz, seq_len, _ = hidden_states.shape
+
         # todo: annotate and understand
         zxbcdt = self.in_proj(hidden_states)
-        d_mlp = (zxbcdt.shape[-1] - 2 * self.intermediate_size - 2 * self.num_heads * self.ssm_state_size - self.num_heads) // 2
+        d_mlp = (zxbcdt.shape[-1] - 2 * self.intermediate_size - 2 * self.ssm_state_size - self.num_heads) // 2
         z0, x0, z, xBC, dt = torch.split(
             zxbcdt,
             [d_mlp, d_mlp, self.intermediate_size, self.intermediate_size + 2 * self.ssm_state_size, self.num_heads],
@@ -232,27 +235,25 @@ class Mamba2Mixer(nn.Module):
         )
 
         xBC = self.act(
-            self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)
+            self.conv1d(xBC.transpose(1, 2))[..., :seq_len].transpose(1, 2)
         )
 
         A = -torch.exp(self.A_log)
         x, B, C = torch.split(
             xBC, [self.intermediate_size, self.ssm_state_size, self.ssm_state_size], dim=-1
         )
-        x = rearrange(x, "b l (h p) -> b l h p", h=self.num_heads)
         B = rearrange(B, "b l (g n) -> b l g n", g=1)
         C = rearrange(C, "b l (g n) -> b l g n", g=1)
-        D = rearrange(self.D, "h -> h 1")
+        x = rearrange(x, "b l (h p) -> b l h p", h=self.num_heads)
         z = rearrange(z, "b l (h p) -> b l h p", h=self.num_heads)
 
         # apply dt with bias and softplus
-        dt += self.dt_bias[:, None]
-        dt = torch.where(dt <= 20.0, torch.log1p(torch.exp(dt)), dt)
-        dt = torch.clamp(dt, self.dt_min, self.dt_max)
+        dt = F.softplus(dt + self.dt_bias).clamp(self.dt_min, self.dt_max)
 
         A = A * dt
         x = x * dt.unsqueeze(-1)
-        D = D * x
+        # todo: check if we use discretized x or not for skip D connection
+        D = self.D[None, None, :] * rearrange(x, "b l h p -> b l (h p)")
 
         hidden_states, _ = self._ssd_chunk_scan(x, A, B, C, self.chunk_size)
         hidden_states = hidden_states + D
