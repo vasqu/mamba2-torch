@@ -7,9 +7,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
-import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
-from einops import rearrange, reduce, repeat
+from einops import rearrange
+from src.ops.ssd_combined import mamba_chunk_scan_combined
 
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
@@ -168,62 +168,15 @@ class Mamba2Mixer(nn.Module):
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(*config.A_initializer_range)
         self.A_log = nn.Parameter(torch.log(A))
 
-        self.D = nn.Parameter(torch.ones(self.intermediate_size))
+        self.D = nn.Parameter(torch.ones(self.num_heads))
 
         # gate normalization introduced for instability, see section 7 of the paper
         self.gate_norm = Mamba2RMSNorm(
             self.intermediate_size, eps=1e-5, norm_before_gate=True
         )
 
-    def _segsum(self, x):
-        """More stable segment sum calculation."""
-        T = x.size(-1)
-        x = repeat(x, "... d -> ... d e", e=T)
-        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=-1)
-        x = x.masked_fill(~mask, 0)
-        x_segsum = torch.cumsum(x, dim=-2)
-        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
-        x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
-        return x_segsum
-
-    def _ssd_chunk_scan(self, X, A, B, C, block_len, initial_states=None):
-        # todo: padding
-
-        # Rearrange into blocks/chunks
-        X, A, B, C = [rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)]
-
-        A = rearrange(A, "b c l h -> b h c l")
-        A_cumsum = torch.cumsum(A, dim=-1)
-
-        # 1. Compute the output for each intra-chunk (diagonal blocks)
-        L = torch.exp(self._segsum(A))
-        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, X)
-
-        # 2. Compute the state for each intra-chunk
-        # (right term of low-rank factorization of off-diagonal blocks; B terms)
-        decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
-        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, X)
-
-        # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
-        # (middle term of factorization of off-diag blocks; A terms)
-        if initial_states is None:
-            initial_states = torch.zeros_like(states[:, :1])
-        states = torch.cat([initial_states, states], dim=1)
-        decay_chunk = torch.exp(self._segsum(torch.F.pad(A_cumsum[:, :, :, -1], (1, 0))))
-        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
-        states, final_state = new_states[:, :-1], new_states[:, -1]
-
-        # 4. Compute state -> output conversion per chunk
-        # (left term of low-rank factorization of off-diagonal blocks; C terms)
-        state_decay_out = torch.exp(A_cumsum)
-        Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
-
-        # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
-        Y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p")
-        return Y, final_state
-
     def forward(self, hidden_states):
-        bsz, seq_len, _ = hidden_states.shape
+        seq_len = hidden_states.shape[1]
 
         # todo: annotate and understand
         zxbcdt = self.in_proj(hidden_states)
@@ -242,28 +195,30 @@ class Mamba2Mixer(nn.Module):
         x, B, C = torch.split(
             xBC, [self.intermediate_size, self.ssm_state_size, self.ssm_state_size], dim=-1
         )
-        B = rearrange(B, "b l (g n) -> b l g n", g=1)
-        C = rearrange(C, "b l (g n) -> b l g n", g=1)
-        x = rearrange(x, "b l (h p) -> b l h p", h=self.num_heads)
-        z = rearrange(z, "b l (h p) -> b l h p", h=self.num_heads)
 
-        # apply dt with bias and softplus
-        dt = F.softplus(dt + self.dt_bias).clamp(self.dt_min, self.dt_max)
-
-        A = A * dt
-        x = x * dt.unsqueeze(-1)
-        # todo: check if we use discretized x or not for skip D connection
-        D = self.D[None, None, :] * rearrange(x, "b l h p -> b l (h p)")
-
-        hidden_states, _ = self._ssd_chunk_scan(x, A, B, C, self.chunk_size)
-        hidden_states = hidden_states + D
-        hidden_states = rearrange(hidden_states, "b l h p -> b l (h p)")
-        hidden_states = self.gate_norm(hidden_states, z)
-
+        y = mamba_chunk_scan_combined(
+            x=rearrange(x, "b l (h p) -> b l h p", p=self.head_dim),
+            dt=dt,
+            A=A,
+            B=rearrange(B, "b l (g n) -> b l g n", g=1),
+            C=rearrange(C, "b l (g n) -> b l g n", g=1),
+            chunk_size=self.chunk_size,
+            D=self.D,
+            z=None,
+            dt_bias=self.dt_bias,
+            dt_softplus=True,
+            seq_idx=None,
+            dt_min=self.dt_min,
+            dt_max=self.dt_max,
+            return_final_states=False
+        )
+        y = rearrange(y, "b l h p -> b l (h p)")
+        y = self.gate_norm(y, z=z)
         if d_mlp > 0:
-            hidden_states = torch.cat([self.act(z0) * x0, hidden_states], dim=-1)
+            y = torch.cat([self.act(z0) * x0, y], dim=-1)
 
-        return self.out_proj(hidden_states)
+        hidden_states = self.out_proj(y)
+        return hidden_states
 
 
 class Mamba2RMSNorm(nn.Module):
