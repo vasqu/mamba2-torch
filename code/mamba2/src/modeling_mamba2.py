@@ -102,6 +102,9 @@ class Mamba2PreTrainedModel(PreTrainedModel):
                     nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=self.config.emb_initializer_range)
+        elif isinstance(module, nn.Conv1d):
+            if self.config.conv_initializer_range is not None:
+                nn.init.uniform_(module.weight, -self.config.conv_initializer_range, self.config.conv_initializer_range)
 
         if self.config.rescale_prenorm_residual:
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
@@ -168,6 +171,7 @@ class Mamba2Mixer(nn.Module):
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(*config.A_initializer_range)
         self.A_log = nn.Parameter(torch.log(A))
 
+        # as D is a skip connection with A, it is also a scalar of the same shape as A
         self.D = nn.Parameter(torch.ones(self.num_heads))
 
         # gate normalization introduced for instability, see section 7 of the paper
@@ -175,10 +179,32 @@ class Mamba2Mixer(nn.Module):
             self.intermediate_size, eps=1e-5, norm_before_gate=True
         )
 
-    def forward(self, hidden_states, return_final_state=False, initial_states=None):
-        seq_len = hidden_states.shape[1]
+    def forward(self, hidden_states, initial_state=None, return_final_state=False, cache=None, use_cache=False):
+        # supporting caching as well as passing initial states but not both at the same time
+        if initial_state is not None and cache is not None and use_cache is True:
+            raise ValueError("Caching and passing initial states is not possible at the same time!")
 
-        # todo: annotate and understand
+        bsz, seq_len, _ = hidden_states.shape
+
+        # will be moved out to backbone later
+        if cache is None and use_cache:
+            cache = {
+                "conv_state" : torch.zeros(
+                    bsz, self.conv1d.weight.shape[0], 4
+                ),
+                "ssm_state" : torch.zeros(
+                    bsz, self.num_heads, self.head_dim, self.ssm_state_size
+                ),
+                "seq_offset" : 0
+            }
+        cached_start = use_cache and cache["seq_offset"] == 0
+        cached_forward = use_cache and cache["seq_offset"] > 0
+
+        # add seq_len to shape when caching: [bsz, hidden_dim] --> [bsz, 1, hidden_dim]
+        if cached_forward:
+            hidden_states = hidden_states.squeeze(1)
+
+        # 1. Parallel projection for the input and reconstructing the necessary vars
         zxbcdt = self.in_proj(hidden_states)
         d_mlp = (zxbcdt.shape[-1] - 2 * self.intermediate_size - 2 * self.ssm_state_size - self.num_heads) // 2
         z0, x0, z, xBC, dt = torch.split(
@@ -187,43 +213,81 @@ class Mamba2Mixer(nn.Module):
             dim=-1
         )
 
-        xBC = self.act(
-            self.conv1d(xBC.transpose(1, 2))[..., :seq_len].transpose(1, 2)
-        )
+        # init cache with first "real" values
+        if cached_start:
+            xBC_t = rearrange(xBC, "b l d -> b d l")
+            cache["conv_state"].copy_(nn.functional.pad(xBC_t, (4 - xBC_t.shape[-1], 0)))
 
-        A = -torch.exp(self.A_log)
+        # 2. Causal convolution for partial set of variables ("input", B, C)
+        if cached_forward:
+            cache["conv_state"].copy_(torch.roll(cache["conv_state"], shifts=-1, dims=-1))
+            cache["conv_state"][:, :, -1] = xBC
+            xBC = torch.sum(cache["conv_state"] * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)
+            if self.conv1d.bias is not None:
+                xBC = xBC + self.conv1d.bias
+            xBC = self.act(xBC)
+        else:
+            xBC = self.act(
+                self.conv1d(xBC.transpose(1, 2))[..., :seq_len].transpose(1, 2)
+            )
+
+        # reconstruct causal convolution vars
         x, B, C = torch.split(
             xBC, [self.intermediate_size, self.ssm_state_size, self.ssm_state_size], dim=-1
         )
 
+        # 3. State Space Duality (SSD) with triton kernel(s)
+        # discretize 1-SS(a)
+        A = -torch.exp(self.A_log)
+        # optional initial state either due to caching or deliberate passing
+        init_state = initial_state if not cached_forward else cache["ssm_state"]
+        # if we are caching we use our seq_len dim which we avoid here
+        BC_pattern = "b l n -> b l 1 n" if not cached_forward else "b n -> b 1 1 n"
+        x_pattern = "b l (h p) -> b l h p" if not cached_forward else "b (h p) -> b 1 h p"
+
+        # some upcasting for vars that help in precision but don't demand much params
         y = mamba_chunk_scan_combined(
-            x=rearrange(x, "b l (h p) -> b l h p", p=self.head_dim),
-            dt=dt,
-            A=A,
-            B=rearrange(B, "b l n -> b l 1 n"),
-            C=rearrange(C, "b l n -> b l 1 n"),
+            x=rearrange(x, pattern=x_pattern, p=self.head_dim),
+            dt=dt if not cached_forward else dt.unsqueeze(1),
+            A=A if not cached_forward else A.to(dtype=torch.float32),
+            B=rearrange(B, pattern=BC_pattern),
+            C=rearrange(C, pattern=BC_pattern),
             chunk_size=self.chunk_size,
-            D=self.D,
+            D=self.D if not cached_forward else self.D.to(dtype=torch.float32),
             z=None,
-            initial_states=initial_states,
-            dt_bias=self.dt_bias,
+            initial_states=init_state,
+            dt_bias=self.dt_bias if not cached_forward else self.dt_bias.to(dtype=torch.float32),
             dt_softplus=True,
             seq_idx=None,
-            dt_min=self.dt_min,
-            dt_max=self.dt_max,
-            return_final_states=return_final_state
+            # split this into non-tuple format
+            dt_min=0.0,
+            dt_max=float("inf"),
+            return_final_states=return_final_state or use_cache
         )
-        last_state = None
-        if return_final_state:
+        if return_final_state or use_cache:
             y, last_state = y
 
+        # 4. Gate normalization introduced for instability, see section 7 of the paper
         y = rearrange(y, "b l h p -> b l (h p)")
         y = self.gate_norm(y, z=z)
         if d_mlp > 0:
             y = torch.cat([self.act(z0) * x0, y], dim=-1)
 
-        hidden_states = self.out_proj(y)
-        return hidden_states, last_state
+        # 5. Out projecting
+        y = self.out_proj(y)
+
+        returned_last_state = None
+        if return_final_state:
+            returned_last_state = last_state
+
+        # update parts of cache and append to output
+        out = (y, returned_last_state,)
+        if use_cache:
+            cache["ssm_state"].copy_(last_state)
+            cache["seq_offset"] = y.shape[1] if cache["seq_offset"] == 0 else cache["seq_offset"] + 1
+            out += (cache,)
+
+        return out
 
 
 class Mamba2RMSNorm(nn.Module):
