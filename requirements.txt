@@ -1,3 +1,5 @@
 triton==2.2.0
 torch==2.2.0
 transformers @ git+https://github.com/huggingface/transformers.git@7729b7747872eabe461a8d2d4ce1068ae0e716a8
+einops>=0.8.0
+safetensors>=0.4.3
