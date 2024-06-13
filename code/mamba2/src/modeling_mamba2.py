@@ -2,7 +2,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, List
 
 import torch
 import torch.utils.checkpoint
@@ -166,13 +166,7 @@ class Mamba2Mixer(nn.Module):
             )
 
     def forward(self, hidden_states, initial_state=None, return_final_state=False, cache: Optional[Mamba2Cache] = None):
-        # supporting caching as well as passing initial states but not both at the same time
-        if initial_state is not None and cache is not None:
-            raise ValueError("Caching and passing initial states is not possible at the same time!")
-
-        bsz, seq_len, _ = hidden_states.shape
-
-        # will be moved out to backbone later
+        # managing cache state
         if cache is not None:
             cached_start = cache.seq_offset == 0
             cached_forward = not cached_start
@@ -180,11 +174,15 @@ class Mamba2Mixer(nn.Module):
             cached_start = False
             cached_forward = False
 
+        # supporting cached values as well as passing initial states but not both at the same time
+        if initial_state is not None and cached_forward:
+            raise ValueError("Subsequent caching and passing initial states is not possible at the same time!")
+
         # add seq_len to shape when caching: [bsz, hidden_dim] --> [bsz, 1, hidden_dim]
         if cached_forward:
             hidden_states = hidden_states.squeeze(1)
 
-        # 1. Parallel projection for the input and reconstructing the necessary vars
+        # 1. Parallel projection for the input
         zxbcdt = self.in_proj(hidden_states)
 
         # 2-5. Combined into one triton kernel
@@ -208,6 +206,7 @@ class Mamba2Mixer(nn.Module):
                 norm_before_gate=False,  # not the same as our variant's normalization var
                 dt_min=0.0,
                 dt_max=float("inf"),
+                initial_states=initial_state,
                 return_final_states=return_final_state
             )
             last_state = None
@@ -215,6 +214,7 @@ class Mamba2Mixer(nn.Module):
                 y, last_state = y
             return y, last_state
 
+        # reconstructing the necessary vars
         d_mlp = (zxbcdt.shape[-1] - 2 * self.intermediate_size - 2 * self.ssm_state_size - self.num_heads) // 2
         z0, x0, z, xBC, dt = torch.split(
             zxbcdt,
@@ -222,12 +222,13 @@ class Mamba2Mixer(nn.Module):
             dim=-1
         )
 
+        # 2. Causal convolution for partial set of variables ("input", B, C)
+
         # init cache with first "real" values
         if cached_start:
             xBC_t = rearrange(xBC, "b l d -> b d l")
             cache.conv_states[self.layer_idx].copy_(nn.functional.pad(xBC_t, (self.conv_kernel_size - xBC_t.shape[-1], 0)))
-
-        # 2. Causal convolution for partial set of variables ("input", B, C)
+        # do the conv1d
         if cached_forward:
             cache.conv_states[self.layer_idx].copy_(torch.roll(cache["conv_state"], shifts=-1, dims=-1))
             cache.conv_states[self.layer_idx][:, :, -1] = xBC
@@ -236,6 +237,7 @@ class Mamba2Mixer(nn.Module):
                 xBC = xBC + self.conv1d.bias
             xBC = self.act(xBC)
         else:
+            seq_len = hidden_states.shape[1]
             xBC = self.act(
                 self.conv1d(xBC.transpose(1, 2))[..., :seq_len].transpose(1, 2)
             )
@@ -402,6 +404,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
             inputs_embeds: Optional[torch.LongTensor] = None,
             cache_params: Optional[Mamba2Cache] = None,
             use_cache: Optional[bool] = None,
+            initial_states: Optional[List[torch.FloatTensor]] = None,
             output_hidden_states: Optional[bool] = None,
             output_last_ssm_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
@@ -432,14 +435,21 @@ class Mamba2Model(Mamba2PreTrainedModel):
                 self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype
             )
 
+        initial_states = [None] * self.config.num_layers if initial_states is None else initial_states
+        if len(initial_states) != self.config.num_layers:
+            raise ValueError(
+                "Initial states have been passed but not for all layers making it ambiguous. "
+                "To ensure correctness, fill layers without an initial state with None."
+            )
         hidden_states = inputs_embeds
+
         all_hidden_states = () if output_hidden_states else None
         all_last_ssm_states = () if output_last_ssm_states else None
-        for mixer_block in self.layers:
+        for mixer_block, initial_state in zip(self.layers, initial_states):
             if self.gradient_checkpointing and self.training:
-                out = self._gradient_checkpointing_func(mixer_block.__call__, hidden_states, None, output_last_ssm_states, cache_params)
+                out = self._gradient_checkpointing_func(mixer_block.__call__, hidden_states, initial_state, output_last_ssm_states, cache_params)
             else:
-                out = mixer_block(hidden_states, return_final_state=output_last_ssm_states, cache=cache_params)
+                out = mixer_block(hidden_states, initial_state=initial_state, return_final_state=output_last_ssm_states, cache=cache_params)
 
             hidden_states = out[0]
             last_state = out[1]
@@ -565,6 +575,7 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel):
             input_ids: Optional[torch.LongTensor] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             cache_params: Optional[Mamba2Cache] = None,
+            initial_states: Optional[List[torch.FloatTensor]] = None,
             labels: Optional[torch.LongTensor] = None,
             output_hidden_states: Optional[bool] = None,
             output_last_ssm_states: Optional[bool] = None,
@@ -582,12 +593,13 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel):
 
         mamba_outputs = self.backbone(
             input_ids,
-            cache_params=cache_params,
             inputs_embeds=inputs_embeds,
+            cache_params=cache_params,
+            use_cache=use_cache,
+            initial_states=initial_states,
             output_hidden_states=output_hidden_states,
             output_last_ssm_states=output_last_ssm_states,
             return_dict=return_dict,
-            use_cache=use_cache,
         )
         hidden_states = mamba_outputs[0]
 
