@@ -1,4 +1,4 @@
-from src.modeling.modeling_mamba2 import Mamba2ForCausalLM
+from core.modeling.modeling_mamba2 import Mamba2ForCausalLM
 from transformers import AutoTokenizer
 
 

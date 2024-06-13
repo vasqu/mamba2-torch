@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/mamba2.iml" filepath="$PROJECT_DIR$/mamba2.iml" />
+      <module fileurl="file://$PROJECT_DIR$/mamba2-torch.iml" filepath="$PROJECT_DIR$/mamba2-torch.iml" />
     </modules>
   </component>
 </project>

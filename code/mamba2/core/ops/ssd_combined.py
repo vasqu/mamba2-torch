@@ -20,24 +20,24 @@ except ImportError:
     causal_conv1d_cuda = None
 
 
-from src.ops.ssd_bmm import (
+from core.ops.ssd_bmm import (
     _bmm_chunk_fwd, _bmm_chunk_bwd
 )
-from src.ops.ssd_chunk_scan import (
+from core.ops.ssd_chunk_scan import (
     _chunk_scan_fwd,
     _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates, _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb, _chunk_scan_bwd_ddAcs_stable
 )
-from src.ops.ssd_chunk_state import (
+from core.ops.ssd_chunk_state import (
     _chunk_cumsum_fwd, _chunk_cumsum_bwd,
     _chunk_state_fwd, _chunk_state_bwd_db,
 )
-from src.ops.ssd_state_passing import (
+from core.ops.ssd_state_passing import (
     _state_passing_fwd, _state_passing_bwd
 )
-from src.ops.k_activations import (
+from core.ops.k_activations import (
     _swiglu_fwd, _swiglu_bwd
 )
-from src.ops.layernorm_gated import (
+from core.ops.layernorm_gated import (
     _layer_norm_fwd, _layer_norm_bwd
 )
 
