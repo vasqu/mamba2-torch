@@ -90,6 +90,7 @@ class Mamba2Config(PretrainedConfig):
         residual_in_fp32=True,
         rescale_prenorm_residual=True,
         tie_embedding_weights=True,
+        use_cache=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -119,5 +120,6 @@ class Mamba2Config(PretrainedConfig):
         self.residual_in_fp32 = residual_in_fp32
         self.rescale_prenorm_residual = rescale_prenorm_residual
         self.tie_embedding_weights = tie_embedding_weights
+        self.use_cache = use_cache
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, pad_token_id=pad_token_id, **kwargs)

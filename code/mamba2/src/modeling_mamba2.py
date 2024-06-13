@@ -416,6 +416,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
             if self.gradient_checkpointing and self.training:
                 out = self._gradient_checkpointing_func(mixer_block.__call__, hidden_states, None, False, cache_params)
             else:
+                # todo: method signature with the return last state etc.
                 out = mixer_block(hidden_states, cache=cache_params)
 
             hidden_states = out[0]
