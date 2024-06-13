@@ -188,10 +188,6 @@ class Mamba2Mixer(nn.Module):
         if initial_state is not None and cached_forward:
             raise ValueError("Subsequent caching and passing initial states is not possible at the same time!")
 
-        # add seq_len to shape when caching: [bsz, hidden_dim] --> [bsz, 1, hidden_dim]
-        if cached_forward:
-            hidden_states = hidden_states.squeeze(1)
-
         # 1. Parallel projection for the input
         zxbcdt = self.in_proj(hidden_states)
 
