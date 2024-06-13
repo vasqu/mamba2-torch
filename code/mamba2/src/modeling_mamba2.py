@@ -47,69 +47,6 @@ class Mamba2Cache:
         }
 
 
-@dataclass
-class Mamba2Output(ModelOutput):
-    """
-    Class for the MAMBA2 model outputs.
-
-    Args:
-        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-            Sequence of hidden-states at the output of the last layer of the model.
-        cache_params (`Mamba2Cache`):
-            The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
-            avoid providing the old `input_ids`.
-
-            Includes both the last state returned by the SSD call of the State Space Machine, and the Causal Convolutional states.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        last_ssm_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_last_ssm_states=True` is passed or when `config.output_last_ssm_states=True`):
-            Tuple of `torch.FloatTensor` (one for the last state of the ssd block each) of shape `(batch_size, num_heads, head_dim, ssm_state_size)`.
-
-            Last SSM-states of the model at the final state of an SSD block.
-    """
-
-    last_hidden_state: Optional[torch.FloatTensor] = None
-    cache_params: Optional[Mamba2Cache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    last_ssm_states: Optional[Tuple[torch.FloatTensor]] = None
-
-
-@dataclass
-class Mamba2CausalLMOutput(ModelOutput):
-    """
-    Base class for causal language model (or autoregressive) outputs.
-
-    Args:
-        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-            Language modeling loss (for next-token prediction).
-        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        cache_params (`Mamba2Cache`):
-            The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
-            avoid providing the old `input_ids`.
-
-            Includes both the last state returned by the SSD call of the State Space Machine, and the Causal Convolutional states.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        last_ssm_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_last_ssm_states=True` is passed or when `config.output_last_ssm_states=True`):
-            Tuple of `torch.FloatTensor` (one for the last state of the ssd block each) of shape `(batch_size, num_heads, head_dim, ssm_state_size)`.
-
-            Last SSM-states of the model at the final state of an SSD block.
-    """
-
-    loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    cache_params: Optional[Mamba2Cache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    last_ssm_states: Optional[Tuple[torch.FloatTensor]] = None
-
-
 class Mamba2PreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
@@ -404,6 +341,36 @@ class Mamba2Block(nn.Module):
         return hidden_states
 
 
+@dataclass
+class Mamba2Output(ModelOutput):
+    """
+    Class for the MAMBA2 model outputs.
+
+    Args:
+        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the model.
+        cache_params (`Mamba2Cache`):
+            The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
+            avoid providing the old `input_ids`.
+
+            Includes both the last state returned by the SSD call of the State Space Machine, and the Causal Convolutional states.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        last_ssm_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_last_ssm_states=True` is passed or when `config.output_last_ssm_states=True`):
+            Tuple of `torch.FloatTensor` (one for the last state of the ssd block each) of shape `(batch_size, num_heads, head_dim, ssm_state_size)`.
+
+            Last SSM-states of the model at the final state of an SSD block.
+    """
+
+    last_hidden_state: Optional[torch.FloatTensor] = None
+    cache_params: Optional[Mamba2Cache] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    last_ssm_states: Optional[Tuple[torch.FloatTensor]] = None
+
+
 class Mamba2Model(Mamba2PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -498,6 +465,39 @@ class Mamba2Model(Mamba2PreTrainedModel):
             hidden_states=all_hidden_states,
             last_ssm_states=all_last_ssm_states
         )
+
+
+@dataclass
+class Mamba2CausalLMOutput(ModelOutput):
+    """
+    Base class for causal language model (or autoregressive) outputs.
+
+    Args:
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        cache_params (`Mamba2Cache`):
+            The state of the model at the last time step. Can be used in a forward method with the next `input_ids` to
+            avoid providing the old `input_ids`.
+
+            Includes both the last state returned by the SSD call of the State Space Machine, and the Causal Convolutional states.
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        last_ssm_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_last_ssm_states=True` is passed or when `config.output_last_ssm_states=True`):
+            Tuple of `torch.FloatTensor` (one for the last state of the ssd block each) of shape `(batch_size, num_heads, head_dim, ssm_state_size)`.
+
+            Last SSM-states of the model at the final state of an SSD block.
+    """
+
+    loss: Optional[torch.FloatTensor] = None
+    logits: Optional[torch.FloatTensor] = None
+    cache_params: Optional[Mamba2Cache] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    last_ssm_states: Optional[Tuple[torch.FloatTensor]] = None
 
 
 class Mamba2ForCausalLM(Mamba2PreTrainedModel):
