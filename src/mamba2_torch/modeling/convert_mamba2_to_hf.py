@@ -1,8 +1,8 @@
 import json
 import argparse
 
-from core.modeling.configuration_mamba2 import Mamba2Config
-from core.modeling.modeling_mamba2 import Mamba2ForCausalLM
+from .configuration_mamba2 import Mamba2Config
+from .modeling_mamba2 import Mamba2ForCausalLM
 
 import torch
 

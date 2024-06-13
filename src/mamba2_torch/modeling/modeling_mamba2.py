@@ -9,8 +9,8 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from einops import rearrange, repeat
-from core.ops.ssd_combined import mamba_chunk_scan_combined
-from core.ops.selective_state_update import selective_state_update
+from ..ops.ssd_combined import mamba_chunk_scan_combined
+from ..ops.selective_state_update import selective_state_update
 
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
@@ -19,14 +19,14 @@ from transformers.utils import (
     logging,
 )
 from transformers.utils.import_utils import is_causal_conv1d_available
-from core.modeling.configuration_mamba2 import Mamba2Config
+from .configuration_mamba2 import Mamba2Config
 
 
 logger = logging.get_logger(__name__)
 
 is_fast_path_available = False
 if is_causal_conv1d_available():
-    from core.ops.ssd_combined import mamba_split_conv1d_scan_combined
+    from ..ops.ssd_combined import mamba_split_conv1d_scan_combined
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
     is_fast_path_available = True
 else:

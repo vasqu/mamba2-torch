@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=66.1.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mamba2_torch"
+version = "0.0.1"
+authors = [
+  { name="Anton Vlasjuk" },
+]
+description = "A huggingface compatible variant of Mamba2 that is not relying on the mamba-ssm cuda wheels."
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: MIT License",
+    "Operating System :: Unix",
+]
+requires-python = ">=3.7"
+dynamic = ["dependencies", "optional-dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+optional-dependencies = {dev = { file = ["requirements-fast-path.txt"] }}
