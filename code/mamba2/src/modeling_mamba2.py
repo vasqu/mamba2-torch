@@ -106,7 +106,14 @@ class Mamba2PreTrainedModel(PreTrainedModel):
 
 class Mamba2Mixer(nn.Module):
     """
-    TODO
+    Using the found relation to the attention mechanism under certain conditions (State-Space-Duality SSD),
+    we use the Multi-input SSM which can be seen as a counterpart to the Multi-value Attention with analogues:
+    - X ~= V
+    - B ~= Q
+    - C ~= K
+    - A (1-SS(a)) ~= Attention Mask
+
+    For an overview, see the mamba2 paper, section 6, figure 4.
     """
 
     def __init__(self, config: Mamba2Config, layer_idx: int):
