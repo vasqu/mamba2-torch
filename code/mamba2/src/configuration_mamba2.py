@@ -16,47 +16,58 @@ class Mamba2Config(PretrainedConfig):
 
     Args:
         vocab_size (`int`, *optional*, defaults to 50280):
-            Vocabulary size of the MAMBA model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`MambaModel`].
-        hidden_size (`int`, *optional*, defaults to 768):
-            Dimensionality of the embeddings and hidden states.
-        state_size (`int`, *optional*, defaults to 16): shape of the state space latents.
-        num_hidden_layers (`int`, *optional*, defaults to 32):
-            Number of hidden layers in the model.
-        layer_norm_epsilon (`float`, *optional*, defaults to 1e-05):
-            The epsilon to use in the layer normalization layers.
+            Vocabulary size of the MAMBA2 model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`Mamba2Model`].
         pad_token_id (`int`, *optional*, defaults to 0):
             Padding token id.
         bos_token_id (`int`, *optional*, defaults to 0):
             The id of the beginning of sentence token in the vocabulary.
         eos_token_id (`int`, *optional*, defaults to 0):
             The id of the end of sentence token in the vocabulary.
-        expand (`int`, *optional*, defaults to 2): Expanding factor used to determine the intermediate size.
-        conv_kernel (`int`, *optional*, defaults to 4): Size of the convolution kernel.
+        hidden_size (`int`, *optional*, defaults to 768):
+            Dimensionality of the embeddings and hidden states.
+        state_size (`int`, *optional*, defaults to 16):
+            Shape of the state space latents.
+        head_dim (`int`, *optional*, defaults to 64):
+            Multi-input SSM head dimension.
+        chunk_size (`int`, *optional*, defaults to 256):
+            Block / Chunk size for the HW-efficient algorithm which parallelizes on intra- and inter-chunk calculations.
+        expand (`int`, *optional*, defaults to 2):
+            Expanding factor used to determine the intermediate size.
+        conv_kernel (`int`, *optional*, defaults to 4):
+            Size of the convolution kernel.
+        num_hidden_layers (`int`, *optional*, defaults to 32):
+            Number of hidden layers in the model.
+        layer_norm_epsilon (`float`, *optional*, defaults to 1e-05):
+            The epsilon to use in the layer normalization layers.
         use_bias (`bool`, *optional*, defaults to `False`):
             Whether or not to use bias in ["in_proj", "out_proj"] of the mixer block
         use_conv_bias (`bool`, *optional*, defaults to `True`):
             Whether or not to use bias in the convolution layer of the mixer block.
         hidden_act (`str`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the decoder.
-        initializer_range (`float`, *optional*, defaults to 0.1):
-            The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        residual_in_fp32 (`bool`, *optional*, defaults to `True`):
-            Whether or not residuals should be in `float32`. If set to `False` residuals will keep the same `dtype` as the rest of the model
-        time_step_rank (`Union[int,str]`, *optional*, defaults to `"auto"`):
-            Rank of the discretization projection matrix. `"auto"` means that it will default to `math.ceil(self.hidden_size / 16)`
-        time_step_scale (`float`, *optional*, defaults to 1.0):
-            Scale used used to scale `dt_proj.bias`.
+        emb_initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing the embedding weight matrix.
+        conv_initializer_range (`float`, *optional*, defaults to None):
+            The range for uniformly initializing the convolution weights.
+        A_initializer_range (`Tuple[int]`, *optional*, defaults to (1, 16)):
+            The range for uniformly initializing the 1-SS(a) scalar.
         time_step_min (`float`, *optional*, defaults to 0.001):
             Minimum `time_step` used to bound `dt_proj.bias`.
         time_step_max (`float`, *optional*, defaults to 0.1):
             Maximum `time_step` used to bound `dt_proj.bias`.
-        time_step_init_scheme (`float`, *optional*, defaults to `"random"`):
-            Init scheme used for `dt_proj.weight`. Should be one of `["random","uniform"]`
         time_step_floor (`float`, *optional*, defaults to 0.0001):
             Minimum clamping value of the `dt_proj.bias` layer initialization.
+        time_step_limit (`Tuple[float]`, *optional*, defaults to (0.0, float("inf"))):
+            Clapping values for the dt weights.
+        residual_in_fp32 (`bool`, *optional*, defaults to `True`):
+            Whether or not residuals should be in `float32`. If set to `False` residuals will keep the same `dtype` as the rest of the model
         rescale_prenorm_residual (`bool`, *optional*, defaults to `False`):
             Whether or not to rescale `out_proj` weights when initializing.
+        tie_embedding_weights (`bool`, *optional*, defaults to `True`):
+            Whether or not to tie the lm head to the input embeddings.
+        output_last_ssm_states (`bool`, *optional*, defaults to `False`):
+            Whether or not return the last ssm states of each layer.
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the cache should be used.
     """
