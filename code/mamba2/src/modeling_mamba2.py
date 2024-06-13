@@ -372,13 +372,14 @@ class Mamba2RMSNorm(nn.Module):
     def forward(self, hidden_states, residual=None):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = hidden_states * self.weight
 
         # residual normalization introduced for instability, see section 7 of the paper
         if residual is not None and self.normalize:
-            hidden_states = nn.functional.silu(hidden_states * residual.to(torch.float32))
+            hidden_states = hidden_states * nn.functional.silu(residual.to(torch.float32))
+
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = hidden_states * self.weight
 
         return hidden_states.to(input_dtype)
 
