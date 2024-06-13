@@ -37,7 +37,7 @@ class Mamba2Cache:
 
         in_channels = config.intermediate_size + 2 * config.ssm_state_size
         self.conv_states = {
-            i: torch.zeros(batch_size, in_channels, config.conv_kernel, device=device, dtype=torch.float16)
+            i: torch.zeros(batch_size, in_channels, config.conv_kernel, device=device, dtype=dtype)
             for i in range(config.num_hidden_layers)
         }
 
