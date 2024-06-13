@@ -19,7 +19,7 @@ from transformers.utils import (
     logging,
 )
 from transformers.utils.import_utils import is_causal_conv1d_available
-from src.configuration_mamba2 import Mamba2Config
+from src.modeling.configuration_mamba2 import Mamba2Config
 
 
 logger = logging.get_logger(__name__)
@@ -38,7 +38,7 @@ class Mamba2Cache:
     def __init__(self, config: Mamba2Config, batch_size: int, device=None, dtype=torch.float16):
         self.seq_offset = 0
 
-        in_channels = config.intermediate_size + 2 * config.ssm_state_size
+        in_channels = config.intermediate_size + 2 * config.state_size
         self.conv_states = {
             i: torch.zeros(batch_size, in_channels, config.conv_kernel, device=device, dtype=dtype)
             for i in range(config.num_hidden_layers)
@@ -134,6 +134,13 @@ class Mamba2Mixer(nn.Module):
         self.use_bias = config.use_bias
         self.use_conv_bias = config.use_conv_bias
 
+        # parallel projection of the input hidden states
+        self.in_proj = nn.Linear(
+            in_features=self.hidden_size,
+            out_features=2 * (self.intermediate_size + self.ssm_state_size) + config.num_heads,
+            bias=config.use_bias
+        )
+
         conv1d_dim = self.intermediate_size + 2 * self.ssm_state_size
         self.conv1d = nn.Conv1d(
             in_channels=conv1d_dim,
@@ -147,15 +154,8 @@ class Mamba2Mixer(nn.Module):
         self.activation = config.hidden_act
         self.act = ACT2FN[config.hidden_act]
 
-        # parallel projection of the input hidden states
-        self.in_proj = nn.Linear(
-            in_features=self.hidden_size,
-            out_features=2 * (self.intermediate_size + self.ssm_state_size) + config.num_heads,
-            bias=config.use_bias
-        )
         # we only use a bias as parameter
         self.dt_bias = nn.Parameter(torch.rand(size=(config.num_heads,)))
-        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
 
         # scalar initialization of A, i.e. 1-Semi-Separable Matrix of A (== 1-SS(a))
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(*config.A_initializer_range)
@@ -165,9 +165,11 @@ class Mamba2Mixer(nn.Module):
         self.D = nn.Parameter(torch.ones(self.num_heads))
 
         # residual normalization introduced for instability, see section 7 of the paper
-        self.gate_norm = Mamba2RMSNorm(
+        self.norm = Mamba2RMSNorm(
             self.intermediate_size, eps=1e-5, normalize=True
         )
+
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -203,13 +205,14 @@ class Mamba2Mixer(nn.Module):
                 chunk_size=self.chunk_size,
                 seq_idx=None,
                 activation=self.activation,
-                rmsnorm_weight=self.gate_norm.weight,
-                rmsnorm_eps=self.gate_norm.eps,
+                rmsnorm_weight=self.norm.weight,
+                rmsnorm_eps=self.norm.eps,
                 outproj_weight=self.out_proj.weight,
                 outproj_bias=self.out_proj.bias,
                 headdim=self.head_dim,
                 ngroups=1,
                 norm_before_gate=False,  # not the same as our variant's normalization var
+                # split this into non-tuple format
                 dt_min=0.0,
                 dt_max=float("inf"),
                 initial_states=initial_state,
@@ -247,7 +250,7 @@ class Mamba2Mixer(nn.Module):
         )
 
         # 4. Gate normalization introduced for instability, see section 7 of the paper
-        y = self.gate_norm(y, z=z)
+        y = self.norm(y, residual=z)
         if d_mlp > 0:
             y = torch.cat([self.act(z0) * x0, y], dim=-1)
 
@@ -324,13 +327,11 @@ class Mamba2Mixer(nn.Module):
 
             y = rearrange(y, "b l h p -> b l (h p)")
         else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
-            dt = repeat(dt, "b h -> b h p", p=self.headdim)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
-            D = repeat(self.D, "h -> h p", p=self.headdim)
-            B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
-            C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
-            x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+            A = repeat(A, "h -> h p n", p=self.head_dim, n=self.ssm_state_size).to(dtype=torch.float32)
+            dt = repeat(dt, "b 1 h -> b h p", p=self.head_dim)
+            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+            D = repeat(self.D, "h -> h p", p=self.head_dim)
+            x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
             y = selective_state_update(
                 cache.ssm_states[self.layer_idx], x_reshaped, dt, A, B, C, D, z=None,
                 dt_bias=dt_bias, dt_softplus=True
@@ -362,7 +363,7 @@ class Mamba2RMSNorm(nn.Module):
             hidden_states = hidden_states * nn.functional.silu(residual.to(torch.float32))
 
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
         hidden_states = hidden_states * self.weight
 
         return hidden_states.to(input_dtype)
@@ -377,15 +378,15 @@ class Mamba2Block(nn.Module):
         self.norm = Mamba2RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, initial_state=None, return_final_state=False, cache: Optional[Mamba2Cache] = None):
         residual = hidden_states
         hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 
-        hidden_states = self.mixer(hidden_states)
+        hidden_states, last_state = self.mixer(hidden_states, initial_state=initial_state, return_final_state=return_final_state, cache=cache)
         hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, last_state
 
 
 @dataclass
@@ -480,8 +481,8 @@ class Mamba2Model(Mamba2PreTrainedModel):
                 self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype
             )
 
-        initial_states = [None] * self.config.num_layers if initial_states is None else initial_states
-        if len(initial_states) != self.config.num_layers:
+        initial_states = [None] * self.config.num_hidden_layers if initial_states is None else initial_states
+        if len(initial_states) != self.config.num_hidden_layers:
             raise ValueError(
                 "Initial states have been passed but not for all layers making it ambiguous. "
                 "To ensure correctness, fill layers without an initial state with None."

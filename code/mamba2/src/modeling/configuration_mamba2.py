@@ -99,7 +99,7 @@ class Mamba2Config(PretrainedConfig):
         time_step_floor=1e-4,
         time_step_limit=(0.0, float("inf")),
         residual_in_fp32=True,
-        rescale_prenorm_residual=True,
+        rescale_prenorm_residual=False,
         tie_embedding_weights=True,
         output_last_ssm_states=False,
         use_cache=True,
