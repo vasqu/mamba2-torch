@@ -10,6 +10,8 @@ NOTE: You can use this repo to use `Mamba2` based models with all optimisation p
 - Trition kernels only (default) 
 - Pure PyTorch
 
+NOTE: I'm not affiliated with the original authors of Mamba2 or Hugging Face.
+
 
 ## Why?
 - Don't have much time to properly test everything.
