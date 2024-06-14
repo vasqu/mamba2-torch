@@ -1,5 +1,5 @@
 from transformers import AutoTokenizer
-from mamba2_torch.modeling.modeling_mamba2 import Mamba2ForCausalLM, Mamba2Config
+from mamba2_torch import Mamba2Model, Mamba2Config, Mamba2ForCausalLM
 
 
 mamba2_130m_hf_path = "/datadisk1/av11/downloads/huggingface/models--mamba2-130m-hf"
