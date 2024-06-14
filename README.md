@@ -67,7 +67,7 @@ print(tokenizer.batch_decode(out))
 - Most work goes to the original [mamba repo](https://github.com/state-spaces/mamba). They did the heavy work, give them your flowers.
 - [ssd_minimal](./tests/ssd_minimal.py) is a small script based on the original script provided by Tri Dao and Albert Gu (see [here](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/ssd_minimal.py)) and modified to work on any sequence length and with the `D` residual connection. A small test that checks roughly equal outputs is [over here](./tests/TestSSDMinimal.py).
 - Possible [AMD support](https://github.com/state-spaces/mamba/pull/359) is in the works.
-- You can get the last state of the SSD blog via the `output_last_ssm_states` flag. This can be either passed down in the forward call itself or by modifying the config beforehand as done in the [example](#usage); just do `config.output_last_ssm_states = True` instead.
+- You can get the last state of the SSD block via the `output_last_ssm_states` flag. This can be either passed down in the forward call itself or by modifying the config beforehand as done in the [example](#usage); just do `config.output_last_ssm_states = True` instead.
 - Careful: With the following feature you won't be able to use the cache anymore; make sure to turn caching off!
     - You can pass initial states to the SSD blocks. This requires a list of the ssm state tensors of shape = `(batch_size, num_heads, head_dim, state_size)`. The list is as long as the number of hidden blocks. If you only want to pass initial states to a set of them, then fill those you don't want to pass it to to `None`.
 - There are still some issues I'm not so sure of myself:
@@ -78,6 +78,7 @@ print(tokenizer.batch_decode(out))
     - Groups in Multi-input SSM
     - Parallelized linear layers
     - Imo insignificant kernels (e.g. RMSNorm)
+- `tie_embedding_weights` flag in the config is probably enforced in any case. Not too interested in digging into this but open for PRs.
 
 
 ## Work this is based on
