@@ -410,9 +410,9 @@ class Mamba2Mixer(nn.Module):
             # Reshaping to have seq_len == 1
             y = rearrange(y, "b h p -> b 1 (h p)")
 
-        # Optional output of last state
-        if return_final_state:
-            last_state = cache.ssm_states[self.layer_idx].clone()
+            # Optional output of last state
+            if return_final_state:
+                last_state = cache.ssm_states[self.layer_idx].clone()
 
         return y, last_state
 
