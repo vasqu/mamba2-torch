@@ -299,7 +299,10 @@ class Mamba2Mixer(nn.Module):
         if pad_size > 0:
             y = y[:, :seq_len, :, :]
 
-        return y, final_state if return_final_states else y
+        if not return_final_states:
+            return y
+        else:
+            return y, final_state
 
     def _ssd(self, x, B, C, dt, initial_state, return_final_state, use_triton_kernels, cache, cached_start, cached_forward):
         # Discretize 1-SS(a)
@@ -327,6 +330,7 @@ class Mamba2Mixer(nn.Module):
                     return_final_states=cached_start or return_final_state
                 )
             else:
+                initial_state = rearrange(initial_state, "b n h p -> b 1 n h p") if initial_state is not None else None
                 y = self._ssd_naive(
                     x=rearrange(x, pattern="b l (h p) -> b l h p", p=self.head_dim),
                     dt=dt,

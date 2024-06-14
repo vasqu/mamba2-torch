@@ -8,5 +8,5 @@ model = Mamba2ForCausalLM.from_pretrained(mamba2_130m_hf_path, local_files_only=
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 input_ids = tokenizer("Hey how are you doing?", return_tensors="pt")["input_ids"].to("cpu")
 
-out = model.generate(input_ids, max_new_tokens=10)
+out = model.generate(input_ids, max_new_tokens=10, use_cache=False)
 print(tokenizer.batch_decode(out))
