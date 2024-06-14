@@ -3,6 +3,13 @@ import torch.nn.functional as F
 from einops import repeat, rearrange
 
 
+def pad_by_size(x, pad_size):
+    pad_shape = (0, 0, 0, 0, 0, pad_size, 0, 0) if len(x.shape) == 4 \
+                 else (0, 0, 0, pad_size, 0, 0)
+
+    return F.pad(x, pad_shape, mode="constant", value=0)
+
+
 def segsum(x):
     """More stable segment sum calculation."""
     T = x.size(-1)
@@ -20,25 +27,28 @@ def ssd_minimal_discrete(X, dt, A, B, C, block_len, D=None, initial_states=None)
     Arguments:
         X:  (batch, length, n_heads, d_head)
         dt: (batch, length, n_heads)
-        A:  (batch, length, n_heads)
+        A:  (n_heads)
         B:  (batch, length, n_heads, d_state)
         C:  (batch, length, n_heads, d_state)
     Return:
         Y:  (batch, length, n_heads, d_head)
     """
     assert X.dtype == A.dtype == B.dtype == C.dtype
-    assert X.shape[1] % block_len == 0
+
+    seq_len = X.shape[1]
+    pad_size = block_len - (seq_len % block_len)
+    #assert X.shape[1] % block_len == 0
 
     # (Optional) D skip connection preparing
     if D is not None:
-        skip = rearrange(D, "h -> 1 1 h 1") * X
+        skip = rearrange(D, "h -> 1 1 h 1") * pad_by_size(X, pad_size)
 
     # Discretize X and A
     X = X * dt.unsqueeze(-1)
     A = A * dt
 
     # Rearrange into blocks/chunks
-    X, A, B, C = [rearrange(x, "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)]
+    X, A, B, C = [rearrange(pad_by_size(x, pad_size), "b (c l) ... -> b c l ...", l=block_len) for x in (X, A, B, C)]
 
     A = rearrange(A, "b c l h -> b h c l")
     A_cumsum = torch.cumsum(A, dim=-1)
@@ -72,5 +82,8 @@ def ssd_minimal_discrete(X, dt, A, B, C, block_len, D=None, initial_states=None)
     # Add optional D residual
     if D is not None:
         Y = Y + skip
+
+    if pad_size > 0:
+        Y = Y[:, :seq_len, :, :]
 
     return Y, final_state

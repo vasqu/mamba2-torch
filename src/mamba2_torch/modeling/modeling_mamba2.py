@@ -171,101 +171,13 @@ class Mamba2Mixer(nn.Module):
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.use_bias)
 
-        if not is_fast_path_available:
-            logger.warning_once(
-                "The fast path is not available because `(causal_conv1d_fn, causal_conv1d_update)` is None. "
-                "Falling back to the naive implementation. To install follow https://github.com/Dao-AILab/causal-conv1d"
-            )
-
-    def forward(self, hidden_states, initial_state=None, return_final_state=False, cache: Optional[Mamba2Cache] = None):
-        # managing cache state
-        if cache is not None:
-            cached_start = cache.seq_offset == 0
-            cached_forward = not cached_start
-        else:
-            cached_start = False
-            cached_forward = False
-
-        # supporting cached values as well as passing initial states but not both at the same time
-        if initial_state is not None and cached_forward:
-            raise ValueError("Subsequent caching and passing initial states is not possible at the same time!")
-
-        # 1. Parallel projection for the input
-        zxbcdt = self.in_proj(hidden_states)
-
-        # 2-5. Combined into one triton kernel
-        if self.training and cache is None and is_fast_path_available:
-            y = mamba_split_conv1d_scan_combined(
-                zxbcdt=zxbcdt,
-                conv1d_weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                conv1d_bias=self.conv1d.bias,
-                dt_bias=self.dt_bias,
-                A=-torch.exp(self.A_log),
-                D=self.D,
-                chunk_size=self.chunk_size,
-                seq_idx=None,
-                activation=self.activation,
-                rmsnorm_weight=self.norm.weight,
-                rmsnorm_eps=self.norm.eps,
-                outproj_weight=self.out_proj.weight,
-                outproj_bias=self.out_proj.bias,
-                headdim=self.head_dim,
-                ngroups=1,
-                norm_before_gate=False,  # not the same as our variant's normalization var
-                # split this into non-tuple format
-                dt_min=0.0,
-                dt_max=float("inf"),
-                initial_states=initial_state,
-                return_final_states=return_final_state
-            )
-            last_state = None
-            if return_final_state:
-                y, last_state = y
-            return y, last_state
-
-        # reconstructing the necessary vars
-        d_mlp = (zxbcdt.shape[-1] - 2 * self.intermediate_size - 2 * self.ssm_state_size - self.num_heads) // 2
-        z0, x0, z, xBC, dt = torch.split(
-            zxbcdt,
-            [d_mlp, d_mlp, self.intermediate_size, self.intermediate_size + 2 * self.ssm_state_size, self.num_heads],
-            dim=-1
-        )
-
-        # 2. Causal convolution for partial set of variables ("input", B, C)
-        xBC = self._conv1d(
-            xBC=xBC, seq_len=hidden_states.shape[1],
-            cache=cache, cached_start=cached_start, cached_forward=cached_forward
-        )
-
-        # reconstruct causal convolution vars
-        x, B, C = torch.split(
-            xBC, [self.intermediate_size, self.ssm_state_size, self.ssm_state_size], dim=-1
-        )
-
-        # 3. State Space Duality (SSD) with triton kernel(s)
-        y, last_state = self._ssd(
-            x=x, B=B, C=C, dt=dt,
-            initial_state=initial_state, return_final_state=return_final_state,
-            cache=cache, cached_start=cached_start, cached_forward=cached_forward
-        )
-
-        # 4. Gate normalization introduced for instability, see section 7 of the paper
-        y = self.norm(y, residual=z)
-        if d_mlp > 0:
-            y = torch.cat([self.act(z0) * x0, y], dim=-1)
-
-        # 5. Out projecting
-        y = self.out_proj(y)
-
-        return y, last_state
-
-    def _conv1d(self, xBC, seq_len, cache, cached_start, cached_forward):
-        # init cache with first "real" values
+    def _conv1d(self, xBC, seq_len, use_triton_kernels, cache, cached_start, cached_forward):
+        # Init cache with first "real" values
         if cached_start:
             xBC_t = rearrange(xBC, "b l d -> b d l")
             cache.conv_states[self.layer_idx].copy_(nn.functional.pad(xBC_t, (self.conv_kernel_size - xBC_t.shape[-1], 0)))
 
-        if is_fast_path_available:
+        if is_fast_path_available and use_triton_kernels:
             if cached_forward:
                 xBC = causal_conv1d_update(
                     xBC,
@@ -296,30 +208,137 @@ class Mamba2Mixer(nn.Module):
 
         return xBC
 
-    def _ssd(self, x, B, C, dt, initial_state, return_final_state, cache, cached_start, cached_forward):
-        # discretize 1-SS(a)
+    def _ssd_naive(self, x, dt, A, B, C, chunk_size, dt_min, dt_max, initial_states=None, return_final_states=False):
+        """
+        Arguments:
+            x:  (batch_size, seq_len, num_heads, head_dim)
+            dt: (batch_size, seq_len, num_heads)
+            A:  (num_heads)
+            B:  (batch_size, seq_len, num_heads, ssm_state_size)
+            C:  (batch_size, seq_len, num_heads, ssm_state_size)
+        Return:
+            y:  (batch_size, seq_len, num_heads, head_dim)
+        """
+
+        def pad_by_size(x, pad_size):
+            """
+            Padding x tensor with `pad_size` on the seq_len dim (dim=1)
+
+            Assumes that we only have tensors of either size 4 or 3
+            """
+            assert 2 < len(x.shape) < 5
+
+            pad_shape = (0, 0, 0, 0, 0, pad_size, 0, 0) if len(x.shape) == 4 \
+                         else (0, 0, 0, pad_size, 0, 0)
+
+            return nn.functional.pad(x, pad_shape, mode="constant", value=0)
+
+        def segsum(x):
+            """
+            More stable segment sum calculation
+            """
+            T = x.size(-1)
+            x = repeat(x, "... d -> ... d e", e=T)
+            mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=-1)
+            x = x.masked_fill(~mask, 0)
+            x_segsum = torch.cumsum(x, dim=-2)
+            mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=0)
+            x_segsum = x_segsum.masked_fill(~mask, -torch.inf)
+            return x_segsum
+
+        # Since it is parallelized by chunks they have to be of the same size which we ensure by padding
+        seq_len = x.shape[1]
+        pad_size = chunk_size - (seq_len % chunk_size)
+
+        # dt softplus and clamping
+        dt = nn.functional.softplus(dt + self.dt_bias)
+        dt = torch.clamp(dt, dt_min, dt_max)
+
+        D_residual = rearrange(self.D, "h -> 1 1 h 1") * pad_by_size(x, pad_size)
+
+        # Discretize x and A
+        x = x * dt.unsqueeze(-1)
+        A = A * dt
+
+        # Rearrange into blocks/chunks
+        x, A, B, C = [rearrange(pad_by_size(t, pad_size), "b (c l) ... -> b c l ...", l=chunk_size) for t in (x, A, B, C)]
+
+        A = rearrange(A, "b c l h -> b h c l")
+        A_cumsum = torch.cumsum(A, dim=-1)
+
+        # 1. Compute the output for each intra-chunk (diagonal blocks)
+        L = torch.exp(segsum(A))
+        Y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", C, B, L, x)
+
+        # 2. Compute the state for each intra-chunk
+        # (right term of low-rank factorization of off-diagonal blocks; B terms)
+        decay_states = torch.exp((A_cumsum[:, :, :, -1:] - A_cumsum))
+        states = torch.einsum("bclhn,bhcl,bclhp->bchpn", B, decay_states, x)
+
+        # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+        # (middle term of factorization of off-diag blocks; A terms)
+        if initial_states is None:
+            initial_states = torch.zeros_like(states[:, :1])
+        states = torch.cat([initial_states, states], dim=1)
+        decay_chunk = torch.exp(segsum(nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0))))
+        new_states = torch.einsum("bhzc,bchpn->bzhpn", decay_chunk, states)
+        states, final_state = new_states[:, :-1], new_states[:, -1]
+
+        # 4. Compute state -> output conversion per chunk
+        # (left term of low-rank factorization of off-diagonal blocks; C terms)
+        state_decay_out = torch.exp(A_cumsum)
+        Y_off = torch.einsum('bclhn,bchpn,bhcl->bclhp', C, states, state_decay_out)
+
+        # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+        y = rearrange(Y_diag+Y_off, "b c l h p -> b (c l) h p")
+
+        # Add D residual to final output
+        y = y + D_residual
+
+        # Cutting off padded chunks
+        if pad_size > 0:
+            y = y[:, :seq_len, :, :]
+
+        return y, final_state if return_final_states else y
+
+    def _ssd(self, x, B, C, dt, initial_state, return_final_state, use_triton_kernels, cache, cached_start, cached_forward):
+        # Discretize 1-SS(a)
         A = -torch.exp(self.A_log) if not cached_forward else -torch.exp(self.A_log.float())
 
         last_state = None
         if not cached_forward:
-            y = mamba_chunk_scan_combined(
-                x=rearrange(x, pattern="b l (h p) -> b l h p", p=self.head_dim),
-                dt=dt,
-                A=A,
-                B=rearrange(B, pattern="b l n -> b l 1 n"),
-                C=rearrange(C, pattern="b l n -> b l 1 n"),
-                chunk_size=self.chunk_size,
-                D=self.D,
-                z=None,
-                initial_states=initial_state,
-                dt_bias=self.dt_bias,
-                dt_softplus=True,
-                seq_idx=None,
-                # split this into non-tuple format
-                dt_min=0.0,
-                dt_max=float("inf"),
-                return_final_states=cached_start or return_final_state
-            )
+            if use_triton_kernels:
+                y = mamba_chunk_scan_combined(
+                    x=rearrange(x, pattern="b l (h p) -> b l h p", p=self.head_dim),
+                    dt=dt,
+                    A=A,
+                    B=rearrange(B, pattern="b l n -> b l 1 n"),
+                    C=rearrange(C, pattern="b l n -> b l 1 n"),
+                    chunk_size=self.chunk_size,
+                    D=self.D,
+                    z=None,
+                    initial_states=initial_state,
+                    dt_bias=self.dt_bias,
+                    dt_softplus=True,
+                    seq_idx=None,
+                    # split this into non-tuple format
+                    dt_min=0.0,
+                    dt_max=float("inf"),
+                    return_final_states=cached_start or return_final_state
+                )
+            else:
+                y = self._ssd_naive(
+                    x=rearrange(x, pattern="b l (h p) -> b l h p", p=self.head_dim),
+                    dt=dt,
+                    A=A,
+                    B=rearrange(B, pattern="b l n -> b l 1 n"),
+                    C=rearrange(C, pattern="b l n -> b l 1 n"),
+                    chunk_size=self.chunk_size,
+                    initial_states=initial_state,
+                    dt_min=0.0,
+                    dt_max=float("inf"),
+                    return_final_states=cached_start or return_final_state
+                )
             if cached_start or return_final_state:
                 y, last_state = y
                 if cached_start:
@@ -327,21 +346,133 @@ class Mamba2Mixer(nn.Module):
 
             y = rearrange(y, "b l h p -> b l (h p)")
         else:
-            A = repeat(A, "h -> h p n", p=self.head_dim, n=self.ssm_state_size).to(dtype=torch.float32)
-            dt = repeat(dt, "b 1 h -> b h p", p=self.head_dim)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
-            D = repeat(self.D, "h -> h p", p=self.head_dim)
-            x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
-            y = selective_state_update(
-                cache.ssm_states[self.layer_idx], x_reshaped, dt, A, B, C, D, z=None,
-                dt_bias=dt_bias, dt_softplus=True
-            )
-            if return_final_state:
-                last_state = cache.ssm_states[self.layer_idx].detach().clone()
+            if use_triton_kernels:
+                A = repeat(A, "h -> h p n", p=self.head_dim, n=self.ssm_state_size).to(dtype=torch.float32)
+                dt = repeat(dt, "b 1 h -> b h p", p=self.head_dim)
+                dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+                D = repeat(self.D, "h -> h p", p=self.head_dim)
+                x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
+                y = selective_state_update(
+                    cache.ssm_states[self.layer_idx], x_reshaped, dt, A, B, C, D, z=None,
+                    dt_bias=dt_bias, dt_softplus=True
+                )
+                y = rearrange(y, "b h p -> b 1 (h p)")
+            else:
+                dt = nn.functional.softplus(dt + self.dt_bias.to(dtype=dt.dtype))
+                dt = rearrange(dt, "b 1 h -> b h")
+                dA = torch.exp(dt * A)
+                x = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
+                dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+                cache.ssm_states[self.layer_idx].copy_(cache.ssm_states[self.layer_idx] * rearrange(dA, "b h -> b h 1 1") + dBx)
+                y = torch.einsum("bhpn,bn->bhp", cache.ssm_states[self.layer_idx], C)
+                y = y + rearrange(self.D, "h -> h 1") * x
+                y = rearrange(y, "b h p -> b (h p)")
 
-            y = rearrange(y, "b h p -> b 1 (h p)")
+        if return_final_state:
+            last_state = cache.ssm_states[self.layer_idx].detach().clone()
 
         return y, last_state
+
+    def _forward(self, hidden_states, use_triton_kernels, initial_state=None, return_final_state=False, cache: Optional[Mamba2Cache] = None):
+        # Managing cache state
+        if cache is not None:
+            cached_start = cache.seq_offset == 0
+            cached_forward = not cached_start
+        else:
+            cached_start = False
+            cached_forward = False
+
+        # Supporting cached values as well as passing initial states but not both at the same time
+        if initial_state is not None and cached_forward:
+            raise ValueError("Subsequent caching and passing initial states is not possible at the same time!")
+
+        # 1. Parallel projection for the input
+        zxbcdt = self.in_proj(hidden_states)
+
+        # 2-5. Training combined into one triton kernel
+        if self.training and cache is None and is_fast_path_available and use_triton_kernels:
+            y = mamba_split_conv1d_scan_combined(
+                zxbcdt=zxbcdt,
+                conv1d_weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                conv1d_bias=self.conv1d.bias,
+                dt_bias=self.dt_bias,
+                A=-torch.exp(self.A_log),
+                D=self.D,
+                chunk_size=self.chunk_size,
+                seq_idx=None,
+                activation=self.activation,
+                rmsnorm_weight=self.norm.weight,
+                rmsnorm_eps=self.norm.eps,
+                outproj_weight=self.out_proj.weight,
+                outproj_bias=self.out_proj.bias,
+                headdim=self.head_dim,
+                ngroups=1,
+                norm_before_gate=False,  # not the same as our variant's normalization var
+                # split this into non-tuple format
+                dt_min=0.0,
+                dt_max=float("inf"),
+                initial_states=initial_state,
+                return_final_states=return_final_state
+            )
+            last_state = None
+            if return_final_state:
+                y, last_state = y
+            return y, last_state
+
+        # Reconstructing the necessary vars
+        d_mlp = (zxbcdt.shape[-1] - 2 * self.intermediate_size - 2 * self.ssm_state_size - self.num_heads) // 2
+        z0, x0, z, xBC, dt = torch.split(
+            zxbcdt,
+            [d_mlp, d_mlp, self.intermediate_size, self.intermediate_size + 2 * self.ssm_state_size, self.num_heads],
+            dim=-1
+        )
+
+        # 2. Causal convolution for partial set of variables ("input", B, C)
+        xBC = self._conv1d(
+            xBC=xBC, seq_len=hidden_states.shape[1],
+            use_triton_kernels=use_triton_kernels,
+            cache=cache, cached_start=cached_start, cached_forward=cached_forward
+        )
+
+        # Reconstruct causal convolution vars
+        x, B, C = torch.split(
+            xBC, [self.intermediate_size, self.ssm_state_size, self.ssm_state_size], dim=-1
+        )
+
+        # 3. State Space Duality (SSD) with triton kernel(s)
+        y, last_state = self._ssd(
+            x=x, B=B, C=C, dt=dt,
+            initial_state=initial_state, return_final_state=return_final_state,
+            use_triton_kernels=use_triton_kernels,
+            cache=cache, cached_start=cached_start, cached_forward=cached_forward
+        )
+
+        # 4. Gate normalization introduced for instability, see section 7 of the paper
+        y = self.norm(y, residual=z)
+        if d_mlp > 0:
+            y = torch.cat([self.act(z0) * x0, y], dim=-1)
+
+        # 5. Out projecting
+        y = self.out_proj(y)
+
+        return y, last_state
+
+    def forward(self, hidden_states, initial_state=None, return_final_state=False, cache: Optional[Mamba2Cache] = None):
+        use_triton_kernels = "cuda" in self.in_proj.weight.device.type
+
+        # AMD might be available later on with https://github.com/state-spaces/mamba/pull/359
+        if use_triton_kernels:
+            if not is_fast_path_available:
+                logger.warning_once(
+                    "Faster path is not available because `(causal_conv1d_fn, causal_conv1d_update)` is None. "
+                    "Falling back to slower implementation. To install follow https://github.com/Dao-AILab/causal-conv1d"
+                )
+        else:
+            logger.warning_once(
+                "Fast path is not available because the GPU is not properly utilized. "
+                "Falling back to naive implementation."
+            )
+        return self._forward(hidden_states, use_triton_kernels, initial_state, return_final_state, cache)
 
 
 class Mamba2RMSNorm(nn.Module):
