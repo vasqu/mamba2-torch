@@ -134,7 +134,7 @@ class Mamba2Mixer(nn.Module):
         self.use_bias = config.use_bias
         self.use_conv_bias = config.use_conv_bias
 
-        # parallel projection of the input hidden states
+        # Parallel projection of the input hidden states
         self.in_proj = nn.Linear(
             in_features=self.hidden_size,
             out_features=2 * (self.intermediate_size + self.ssm_state_size) + config.num_heads,
@@ -154,17 +154,17 @@ class Mamba2Mixer(nn.Module):
         self.activation = config.hidden_act
         self.act = ACT2FN[config.hidden_act]
 
-        # we only use a bias as parameter
+        # We only use a bias as parameter
         self.dt_bias = nn.Parameter(torch.rand(size=(config.num_heads,)))
 
-        # scalar initialization of A, i.e. 1-Semi-Separable Matrix of A (== 1-SS(a))
+        # Scalar initialization of A, i.e. 1-Semi-Separable Matrix of A (== 1-SS(a))
         A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(*config.A_initializer_range)
         self.A_log = nn.Parameter(torch.log(A))
 
-        # as D is a skip connection with A, it is also a scalar of the same shape as A
+        # As D is a skip connection with A, it is also a scalar of the same shape as A
         self.D = nn.Parameter(torch.ones(self.num_heads))
 
-        # residual normalization introduced for instability, see section 7 of the paper
+        # Residual normalization introduced for instability, see section 7 of the paper
         self.norm = Mamba2RMSNorm(
             self.intermediate_size, eps=1e-5, normalize=True
         )
@@ -351,27 +351,43 @@ class Mamba2Mixer(nn.Module):
             y = rearrange(y, "b l h p -> b l (h p)")
         else:
             if use_triton_kernels:
+                # Preparing values for single step
                 A = repeat(A, "h -> h p n", p=self.head_dim, n=self.ssm_state_size).to(dtype=torch.float32)
                 dt = repeat(dt, "b 1 h -> b h p", p=self.head_dim)
                 dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
                 D = repeat(self.D, "h -> h p", p=self.head_dim)
                 x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
+
+                # Triton kernel for updating states in-place and returning the hidden state
                 y = selective_state_update(
                     cache.ssm_states[self.layer_idx], x_reshaped, dt, A, B, C, D, z=None,
                     dt_bias=dt_bias, dt_softplus=True
                 )
-                y = rearrange(y, "b h p -> b 1 (h p)")
             else:
+                # Get time step with softplus and bias
                 dt = nn.functional.softplus(dt + self.dt_bias.to(dtype=dt.dtype))
                 dt = rearrange(dt, "b 1 h -> b h")
+
+                # Discretize A
                 dA = torch.exp(dt * A)
+
+                # Discretize B and x
                 x = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
                 dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
-                cache.ssm_states[self.layer_idx].copy_(cache.ssm_states[self.layer_idx] * rearrange(dA, "b h -> b h 1 1") + dBx)
-                y = torch.einsum("bhpn,bn->bhp", cache.ssm_states[self.layer_idx], C)
-                y = y + rearrange(self.D, "h -> h 1") * x
-                y = rearrange(y, "b h p -> b (h p)")
 
+                # State calculation
+                cache.ssm_states[self.layer_idx].copy_(cache.ssm_states[self.layer_idx] * rearrange(dA, "b h -> b h 1 1") + dBx)
+
+                # Subsequent output
+                y = torch.einsum("bhpn,bn->bhp", cache.ssm_states[self.layer_idx], C)
+
+                # D skip connection
+                y = y + rearrange(self.D, "h -> h 1") * x
+
+            # Reshaping to have seq_len == 1
+            y = rearrange(y, "b h p -> b 1 (h p)")
+
+        # Optional output of last state, detached from possible gradients
         if return_final_state:
             last_state = cache.ssm_states[self.layer_idx].detach().clone()
 
