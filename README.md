@@ -27,7 +27,7 @@ git clone https://github.com/vasqu/mamba2-torch.git
 cd mamba2-torch
 pip install .
 ``` 
-To use triton kernels and [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d), you need to install the [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) package separately.
+To use the "fastest" path, you need to install the [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) package separately.
 
 
 ## Usage
