@@ -133,6 +133,7 @@ class Mamba2Mixer(nn.Module):
         self.layer_idx = layer_idx
         self.use_bias = config.use_bias
         self.use_conv_bias = config.use_conv_bias
+        self.use_triton_kernels = config.use_triton_kernels
 
         # Parallel projection of the input hidden states
         self.in_proj = nn.Linear(
@@ -478,7 +479,7 @@ class Mamba2Mixer(nn.Module):
         return y, last_state
 
     def forward(self, hidden_states, initial_state=None, return_final_state=False, cache: Optional[Mamba2Cache] = None):
-        use_triton_kernels = "cuda" in self.in_proj.weight.device.type
+        use_triton_kernels = "cuda" in self.in_proj.weight.device.type and self.use_triton_kernels
 
         # AMD might be available later on with https://github.com/state-spaces/mamba/pull/359
         if use_triton_kernels:

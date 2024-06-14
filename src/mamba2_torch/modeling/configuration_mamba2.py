@@ -70,6 +70,8 @@ class Mamba2Config(PretrainedConfig):
             Whether or not return the last ssm states of each layer.
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the cache should be used.
+        use_triton_kernels (`bool`, *optional*, defaults to `True`):
+            Whether or not to use the triton kernels.
     """
 
     model_type = "mamba2"
@@ -103,6 +105,7 @@ class Mamba2Config(PretrainedConfig):
         tie_embedding_weights=True,
         output_last_ssm_states=False,
         use_cache=True,
+        use_triton_kernels=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -134,5 +137,6 @@ class Mamba2Config(PretrainedConfig):
         self.tie_embedding_weights = tie_embedding_weights
         self.output_last_ssm_states = output_last_ssm_states
         self.use_cache = use_cache
+        self.use_triton_kernels = use_triton_kernels
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, pad_token_id=pad_token_id, **kwargs)

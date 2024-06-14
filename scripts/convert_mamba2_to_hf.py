@@ -1,5 +1,6 @@
 import json
 import argparse
+from os import makedirs
 
 from mamba2_torch.modeling.configuration_mamba2 import Mamba2Config
 from mamba2_torch.modeling.modeling_mamba2 import Mamba2ForCausalLM
@@ -44,6 +45,7 @@ def convert_ssm_to_hf(ssm_dir, output_dir):
     hf_model.load_state_dict(hf_state_dict)
 
     print(f"Saving hf config and hf model to {output_dir}")
+    makedirs(output_dir, exist_ok=True)
     save_model(hf_model, output_dir + "/model.safetensors", metadata={'format': 'pt'})
     hf_config.save_pretrained(output_dir)
 
