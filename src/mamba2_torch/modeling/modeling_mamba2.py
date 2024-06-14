@@ -410,9 +410,9 @@ class Mamba2Mixer(nn.Module):
             # Reshaping to have seq_len == 1
             y = rearrange(y, "b h p -> b 1 (h p)")
 
-        # Optional output of last state, detached from possible gradients
+        # Optional output of last state
         if return_final_state:
-            last_state = cache.ssm_states[self.layer_idx].detach().clone()
+            last_state = cache.ssm_states[self.layer_idx].clone()
 
         return y, last_state
 
@@ -490,7 +490,7 @@ class Mamba2Mixer(nn.Module):
         # Reconstruct causal convolution vars
         x, B, C = torch.split(xBC, [self.intermediate_size, self.ssm_state_size, self.ssm_state_size], dim=-1)
 
-        # 3. State Space Duality (SSD) with triton kernel(s)
+        # 3. State Space Duality (SSD)
         y, last_state = self._ssd(
             x=x,
             B=B,

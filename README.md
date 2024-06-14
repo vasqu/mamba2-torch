@@ -74,6 +74,10 @@ print(tokenizer.batch_decode(out))
     - [Compiling](https://github.com/vasqu/mamba2-torch/issues/1#issue-2349175830) doesn't seem to work on my end which would boost the performance of triton kernels even more.
     - [NaN losses](https://github.com/vasqu/mamba2-torch/issues/2#issue-2349255152) seem to be fixed but you have to make sure that `( (d_model * expand) / headdim ) % 8 == 0`.
 - To properly utilize caching, you will need (at least) the pinned version in the [requirements.txt](requirements.txt) of the transformers library.
+- Some optional parallelization options introduced in the original mamba2 repo have been left out:
+    - Groups in Multi-input SSM
+    - Parallelized linear layers
+    - Imo insignificant kernels (e.g. RMSNorm)
 
 
 ## Work this is based on
