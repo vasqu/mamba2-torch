@@ -66,11 +66,12 @@ print(tokenizer.batch_decode(out))
 - [ssd_minimal](./tests/ssd_minimal.py) is a small script based on the original script provided by Tri Dao and Albert Gu (see [here](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/ssd_minimal.py)) and modified to work on any sequence length and with the `D` residual connection. A small test that checks roughly equal outputs is [over here](./tests/TestSSDMinimal.py).
 - Possible [AMD support](https://github.com/state-spaces/mamba/pull/359) is in the works.
 - You can get the last state of the SSD blog via the `output_last_ssm_states` flag. This can be either passed down in the forward call itself or by modifying the config beforehand as done in the [example](#usage); just do `config.output_last_ssm_states = True` instead.
-- Careful: With the following feature you won't be able to use the cache anymore.
+- Careful: With the following feature you won't be able to use the cache anymore; make sure to turn caching off!
     - You can pass initial states to the SSD blocks. This requires a list of the ssm state tensors of shape = `(batch_size, num_heads, head_dim, state_size`. The list is as long as the number of hidden blocks. If you only want to pass initial states to a set of them, then fill those you don't want to pass it to to `None`.
 - There are still some issues I'm not so sure of myself:
     - [Compiling](https://github.com/vasqu/mamba2-torch/issues/1#issue-2349175830) doesn't seem to work on my end which would boost the performance of triton kernels even more.
     - [NaN losses](https://github.com/vasqu/mamba2-torch/issues/2#issue-2349255152) seem to be fixed but you have to make sure that `( (d_model * expand) / headdim ) % 8 == 0`.
+- To properly utilize caching, you will need (at least) the pinned version in the [requirements.txt](requirements.txt) 
 
 
 ## Work this is based on
