@@ -45,7 +45,7 @@ from mamba2_torch import Mamba2Model, Mamba2ForCausalLM, Mamba2Config
 
 mamba2_hf_path = "<path-to-converted-model>"
 
-# you can optionally disable the trition kernels if you want to
+# you can optionally disable the triton kernels if you want to
 # this automatically happens when you use it on cpu
 config = Mamba2Config.from_pretrained(mamba2_hf_path, local_files_only=True)
 config.use_triton_kernels = False
@@ -57,7 +57,7 @@ model = Mamba2ForCausalLM.from_pretrained(mamba2_hf_path, config=config, local_f
 tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
 input_ids = tokenizer("Hey how are you doing?", return_tensors="pt")["input_ids"].to("cuda")
 
-# expected output: `["Hey how are you doing?\n\nI'm in the middle of a project"]`
+# expected output (130m): `["Hey how are you doing?\n\nI'm in the middle of a project"]`
 out = model.generate(input_ids, max_new_tokens=10)
 print(tokenizer.batch_decode(out))
 ```
