@@ -7,7 +7,7 @@
 
 NOTE: You can use this repo to use `Mamba2` based models with all optimisation paths:
 - Triton kernels and [causal-conv1d](https://github.com/Dao-AILab/causal-conv1d) ("fastest")
-- Trition kernels only (default) 
+- Triton kernels only (default) 
 - Pure PyTorch
 
 NOTE: I'm not affiliated with the original authors of Mamba2 or Hugging Face.
@@ -21,7 +21,7 @@ NOTE: I'm not affiliated with the original authors of Mamba2 or Hugging Face.
 
 
 ## Installation
-I won't distribute a pypi package but you can use it as package by cloning the repo and installing it at root:
+I won't distribute a pypi package, but you can use it as package by cloning the repo and installing it at root:
 ```bash
 git clone https://github.com/vasqu/mamba2-torch.git
 cd mamba2-torch
