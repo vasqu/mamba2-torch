@@ -1,17 +1,20 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
-"""We want triton==2.1.0 or 2.2.0 for this"""
+"""We want triton==2.1.0 or 2.2.0 for this
+"""
 
 import math
 import torch
+import torch.nn.functional as F
 
 import triton
 import triton.language as tl
 
+from einops import rearrange, repeat
+
 
 def init_to_zero(names):
     return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
-
 
 @triton.autotune(
     configs=[
@@ -566,7 +569,7 @@ def _chunk_state_bwd_ddAcs_stable_kernel(
     tl.atomic_add(ddA_cumsum_ptrs + stride_ddA_cs_csize, ddA_cs, mask=offs_m < chunk_size - 1)
 
 
-def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_min=0.0, dt_max=float("inf")):
+def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
     batch, seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
     if dt_bias is not None:
@@ -579,7 +582,7 @@ def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_min
         _chunk_cumsum_fwd_kernel[grid_chunk_cs](
             dt, A, dt_bias, dt_out, dA_cumsum,
             batch, seqlen, nheads, chunk_size,
-            dt_min, dt_max,
+            dt_limit[0], dt_limit[1],
             dt.stride(0), dt.stride(1), dt.stride(2),
             A.stride(0),
             dt_bias.stride(0) if dt_bias is not None else 0,
@@ -592,7 +595,7 @@ def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_min
     return dA_cumsum, dt_out
 
 
-def _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=None, dt_softplus=False, dt_min=0.0, dt_max=float("inf"), ddt=None):
+def _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")), ddt=None):
     batch, seqlen, nheads = dt.shape
     _, _, nchunks, chunk_size = ddA.shape
     assert ddA.shape == (batch, nheads, nchunks, chunk_size)
@@ -613,7 +616,7 @@ def _chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias=None, dt_softplus=False, dt_m
         _chunk_cumsum_bwd_kernel[grid_chunk_cs](
             ddA, ddt_out, dt, A, dt_bias, ddt, dA, ddt_bias,
             batch, seqlen, nheads, chunk_size,
-            dt_min, dt_max,
+            dt_limit[0], dt_limit[1],
             ddA.stride(0), ddA.stride(2), ddA.stride(1), ddA.stride(3),
             ddt_out.stride(0), ddt_out.stride(2), ddt_out.stride(1), ddt_out.stride(3),
             dt.stride(0), dt.stride(1), dt.stride(2),
@@ -748,3 +751,116 @@ def _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=None, B=None, ngroups
         # But it's easier to just do the cumsum for all elements, the result will be the same.
         torch.cumsum(ddA_cumsum, dim=-1, out=ddA_cumsum)
     return dB if B is None else (dB, ddA_cumsum)
+
+
+def _chunk_state_bwd_ddAcs_stable(B, x, dt, dA_cumsum, dstates, seq_idx=None):
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, nchunks, chunk_size = dt.shape
+    _, _, ngroups, dstate = B.shape
+    assert nheads % ngroups == 0
+    assert B.shape == (batch, seqlen, ngroups, dstate)
+    assert dt.shape == (batch, nheads, nchunks, chunk_size)
+    assert dA_cumsum.shape == dt.shape
+    assert dstates.shape == (batch, nchunks, nheads, headdim, dstate)
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen)
+    # Use torch.empty since the Triton kernel will call init_to_zero
+    ddA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=x.device, dtype=torch.float32)
+    grid_ddtcs = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
+                               batch * nchunks, nheads)
+    with torch.cuda.device(x.device.index):
+        _chunk_state_bwd_ddAcs_stable_kernel[grid_ddtcs](
+            x, B, dstates, dt, dA_cumsum, seq_idx, ddA_cumsum,
+            chunk_size, headdim, dstate,
+            batch, seqlen, nheads // ngroups,
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            B.stride(0), B.stride(1), B.stride(2), B.stride(-1),
+            dstates.stride(0), dstates.stride(1), dstates.stride(2), dstates.stride(3), dstates.stride(4),
+            dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3),
+            dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
+            *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
+            ddA_cumsum.stride(0), ddA_cumsum.stride(2), ddA_cumsum.stride(1), ddA_cumsum.stride(3),
+            HAS_SEQ_IDX=seq_idx is not None,
+            BLOCK_SIZE_M=max(triton.next_power_of_2(chunk_size), 16),
+            BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
+                           )
+    torch.cumsum(ddA_cumsum[..., 1:], dim=-1, out=ddA_cumsum[..., 1:])
+    return ddA_cumsum
+
+
+class ChunkStateFn(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, B, x, dt, dA_cumsum, states_in_fp32=True):
+        batch, seqlen, nheads, headdim = x.shape
+        _, _, nchunks, chunk_size = dt.shape
+        assert seqlen <= nchunks * chunk_size
+        _, _, ngroups, dstate = B.shape
+        assert B.shape == (batch, seqlen, ngroups, dstate)
+        assert dt.shape == (batch, nheads, nchunks, chunk_size)
+        assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
+        if B.stride(-1) != 1:
+            B = B.contiguous()
+        if x.stride(-1) != 1 and x.stride(1) != 1:  # Either M or K dimension should be contiguous
+            x = x.contiguous()
+        states = _chunk_state_fwd(B, x, dt, dA_cumsum, states_in_fp32=states_in_fp32)
+        ctx.save_for_backward(B, x, dt, dA_cumsum)
+        return states
+
+    @staticmethod
+    def backward(ctx, dstates):
+        B, x, dt, dA_cumsum = ctx.saved_tensors
+        batch, seqlen, nheads, headdim = x.shape
+        _, _, nchunks, chunk_size = dt.shape
+        _, _, ngroups, dstate = B.shape
+        assert dstates.shape == (batch, nchunks, nheads, headdim, dstate)
+        if dstates.stride(-1) != 1:
+            dstates = dstates.contiguous()
+        dx, ddt, ddA_cumsum = _chunk_state_bwd_dx(B, x, dt, dA_cumsum, dstates)
+        dB = _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, ngroups=ngroups)
+        dB = dB.to(B.dtype)
+        return dB, dx, ddt, ddA_cumsum, None
+
+
+def chunk_state(B, x, dt, dA_cumsum, states_in_fp32=True):
+    """
+    Argument:
+        B: (batch, seqlen, ngroups, headdim)
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, nheads, nchunks, chunk_size)
+        dA_cumsum: (batch, nheads, nchunks, chunk_size)
+    Return:
+        states: (batch, nchunks, nheads, headdim, dstate)
+    """
+    return ChunkStateFn.apply(B, x, dt, dA_cumsum, states_in_fp32)
+
+
+def chunk_state_ref(B, x, dt, dA_cumsum):
+    """
+    Argument:
+        B: (batch, seqlen, ngroups, headdim)
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, nheads, nchunks, chunk_size)
+        dA_cumsum: (batch, nheads, nchunks, chunk_size)
+    Return:
+        states: (batch, nchunks, nheads, headdim, dstate)
+    """
+    # Check constraints.
+    batch, seqlen, nheads, headdim = x.shape
+    dstate = B.shape[-1]
+    _, _, nchunks, chunk_size = dt.shape
+    assert seqlen <= nchunks * chunk_size
+    assert x.shape == (batch, seqlen, nheads, headdim)
+    assert dt.shape == (batch, nheads, nchunks, chunk_size)
+    ngroups = B.shape[2]
+    assert nheads % ngroups == 0
+    assert B.shape == (batch, seqlen, ngroups, dstate)
+    B = repeat(B, "b l g d -> b l (g h) d", h=nheads // ngroups)
+    assert dA_cumsum.shape == (batch, nheads, nchunks, chunk_size)
+    if seqlen < nchunks * chunk_size:
+        x = F.pad(x, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+        B = F.pad(B, (0, 0, 0, 0, 0, nchunks * chunk_size - seqlen))
+    x = rearrange(x, "b (c l) h p -> b c l h p", l=chunk_size)
+    B = rearrange(B, "b (c l) ... -> b c l ...", l=chunk_size)
+    decay_states = torch.exp((dA_cumsum[:, :, :, -1:] - dA_cumsum))
+    return torch.einsum("bclhn,bhcl,bhcl,bclhp->bchpn", B.to(x.dtype), decay_states.to(x.dtype), dt.to(x.dtype), x)

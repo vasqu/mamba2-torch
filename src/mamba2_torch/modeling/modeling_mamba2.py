@@ -337,9 +337,7 @@ class Mamba2Mixer(nn.Module):
                     dt_bias=self.dt_bias,
                     dt_softplus=True,
                     seq_idx=None,
-                    # split this into non-tuple format
-                    dt_min=self.dt_min,
-                    dt_max=self.dt_max,
+                    dt_limit=(self.dt_min, self.dt_max),
                     return_final_states=cached_start or return_final_state,
                 )
             else:
@@ -458,9 +456,7 @@ class Mamba2Mixer(nn.Module):
                 headdim=self.head_dim,
                 ngroups=1,
                 norm_before_gate=False,  # not the same as our variant's normalization var
-                # split this into non-tuple format
-                dt_min=self.dt_min,
-                dt_max=self.dt_max,
+                dt_limit=(self.dt_min, self.dt_max),
                 initial_states=initial_state,
                 return_final_states=return_final_state,
             )

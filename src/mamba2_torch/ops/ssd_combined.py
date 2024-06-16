@@ -1,45 +1,43 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
-"""We want triton==2.1.0 or 2.2.0 for this"""
+"""We want triton==2.1.0 or 2.2.0 for this
+"""
+
+from typing import Optional
 
 import math
 from packaging import version
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
+from torch.cuda.amp import custom_bwd, custom_fwd
 
 import triton
 import triton.language as tl
-from torch.cuda.amp import custom_bwd, custom_fwd
 
-from einops import rearrange
+from einops import rearrange, repeat
 
 try:
+    from causal_conv1d import causal_conv1d_fn
     import causal_conv1d_cuda
 except ImportError:
-    causal_conv1d_cuda = None
+    causal_conv1d_fn, causal_conv1d_cuda = None, None
 
-
-from .ssd_bmm import (
-    _bmm_chunk_fwd, _bmm_chunk_bwd
-)
-from .ssd_chunk_scan import (
-    _chunk_scan_fwd,
-    _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates, _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb, _chunk_scan_bwd_ddAcs_stable
-)
-from .ssd_chunk_state import (
-    _chunk_cumsum_fwd, _chunk_cumsum_bwd,
-    _chunk_state_fwd, _chunk_state_bwd_db,
-)
-from .ssd_state_passing import (
-    _state_passing_fwd, _state_passing_bwd
-)
-from .k_activations import (
-    _swiglu_fwd, _swiglu_bwd
-)
-from .layernorm_gated import (
-    _layer_norm_fwd, _layer_norm_bwd
-)
+from mamba_ssm.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
+from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
+from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_fwd, _chunk_state_bwd_db
+from mamba_ssm.ops.triton.ssd_chunk_state import _chunk_state_bwd_ddAcs_stable
+from mamba_ssm.ops.triton.ssd_chunk_state import chunk_state, chunk_state_ref
+from mamba_ssm.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
+from mamba_ssm.ops.triton.ssd_state_passing import state_passing, state_passing_ref
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_fwd, _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_stable
+from mamba_ssm.ops.triton.ssd_chunk_scan import chunk_scan, chunk_scan_ref
+from mamba_ssm.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_prev
+from mamba_ssm.ops.triton.layernorm_gated import rmsnorm_fn, _layer_norm_fwd, _layer_norm_bwd
+from mamba_ssm.ops.triton.k_activations import _swiglu_fwd, _swiglu_bwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
 
@@ -279,7 +277,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
     return dx, ddt.to(dtype=dt.dtype), dD
 
 
-def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_min=0.0, dt_max=float("inf")):
+def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     assert nheads % ngroups == 0
@@ -310,7 +308,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
     # dA_cumsum_tmp0, dt_tmp0 = _chunk_cumsum_fwd(dt[:, :147], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # dA_cumsum_tmp1, dt_tmp1 = _chunk_cumsum_fwd(dt[:, 147:], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
     # dA_cumsum_tmp2, dt_tmp2 = _chunk_cumsum_fwd(dt[:, 147:256], A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus)
-    dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_min=dt_min, dt_max=dt_max)
+    dA_cumsum, dt = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
     # states_tmp0 = _chunk_state_fwd(B[:, :147], x[:, :147], dt_tmp0, dA_cumsum_tmp0, states_in_fp32=True)
     # states_tmp1 = _chunk_state_fwd(B[:, 147:], x[:, 147:], dt_tmp1, dA_cumsum_tmp1, states_in_fp32=True)
@@ -328,7 +326,7 @@ def _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=None, z=None, d
 
 def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None, z=None,
                                    dt_bias=None, initial_states=None, dfinal_states=None, seq_idx=None, dt_softplus=False,
-                                   dt_min=0.0, dt_max=float("inf"),
+                                   dt_limit=(0.0, float("inf")),
                                    dx=None, ddt=None, dB=None, dC=None, dz=None, recompute_output=False):
     if dout.stride(-1) != 1:
         dout = dout.contiguous()
@@ -370,7 +368,7 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
     dt_in = dt.clone()
     dA_cumsum, dt = _chunk_cumsum_fwd(dt_in, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus,
-                                      dt_min=dt_min, dt_max=dt_max)
+                                      dt_limit=dt_limit)
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
     states, _ = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
@@ -436,7 +434,7 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
     ddA += ddA_next + ddA_prev
 
-    ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(ddA, ddt, dt_in, A, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_min=dt_min, dt_max=dt_max, ddt=ddt_given)
+    ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(ddA, ddt, dt_in, A, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit, ddt=ddt_given)
 
     # These 2 lines are just to test ddt and dA being computed by old code
     # _, dA = selective_scan_bwd(dout, x, dt, A, B, C, D=D.float(), z=z)
@@ -446,17 +444,93 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
     return return_vals if not recompute_output else (*return_vals, outz)
 
 
+def selective_scan_bwd(dout, x, dt, A, B, C, D=None, z=None):
+    """
+    Argument:
+        dout: (batch, seqlen, nheads, headdim)
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, nheads, nchunks, chunk_size) or (batch, nheads, headdim, nchunks, chunk_size)
+        A: (nheads) or (dim, dstate)
+        B: (batch, seqlen, ngroups, dstate)
+        C: (batch, seqlen, ngroups, dstate)
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, nheads, headdim)
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+    """
+    import selective_scan
+
+    batch, seqlen, nheads, headdim = x.shape
+    chunk_size = dt.shape[-1]
+    _, _, ngroups, dstate = B.shape
+    assert nheads % ngroups == 0
+    x = rearrange(x, "b l h p -> b (h p) l")
+    squeeze_dt = dt.dim() == 4
+    if dt.dim() == 4:
+        dt = repeat(dt, "b h c l -> b h p c l", p=headdim)
+    dt = rearrange(dt, "b h p c l -> b (h p) (c l)", p=headdim)
+    squeeze_A = A.dim() == 1
+    if A.dim() == 1:
+        A = repeat(A, "h -> (h p) n", p=headdim, n=dstate).to(dtype=torch.float32)
+    else:
+        A = A.to(dtype=torch.float32)
+    B = rearrange(B, "b l g n -> b g n l")
+    C = rearrange(C, "b l g n -> b g n l")
+    if D is not None:
+        if D.dim() == 2:
+            D = rearrange(D, "h p -> (h p)")
+        else:
+            D = repeat(D, "h -> (h p)", p=headdim)
+    if z is not None:
+        z = rearrange(z, "b l h p -> b (h p) l")
+
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if dt.stride(-1) != 1:
+        dt = dt.contiguous()
+    if D is not None:
+        D = D.contiguous()
+    if B.stride(-1) != 1:
+        B = B.contiguous()
+    if C.stride(-1) != 1:
+        C = C.contiguous()
+    if z is not None and z.stride(-1) != 1:
+        z = z.contiguous()
+    _, intermediate, *rest = selective_scan.fwd(x, dt.to(dtype=x.dtype), A, B, C, D, z, None, False)
+    if z is not None:
+        out = rest[0]
+    else:
+        out = None
+
+    dout = rearrange(dout, "b l h p -> b (h p) l")
+
+    if dout.stride(-1) != 1:
+        dout = dout.contiguous()
+    # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
+    # backward of selective_scan with the backward of chunk).
+    # Here we just pass in None and dz will be allocated in the C++ code.
+    _, ddt, dA, *rest = selective_scan.bwd(
+        x, dt.to(dtype=x.dtype), A, B, C, D, z, None, dout, intermediate, out, None, False,
+        False  # option to recompute out_z, not used here
+    )
+    ddt = rearrange(ddt, "b (h p) (c l) -> b h p c l", p=headdim, l=chunk_size)
+    if squeeze_dt:
+        ddt = ddt.float().sum(dim=2)
+    if squeeze_A:
+        dA = rearrange(dA, "(h p) n -> h p n", p=headdim).sum(dim=(1, 2))
+    return ddt, dA
+
+
 class MambaChunkScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_min=0.0, dt_max=float("inf"), return_final_states=False):
+    def forward(ctx, x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False):
         ctx.dt_dtype = dt.dtype
-        out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=dt_softplus, dt_min=dt_min, dt_max=dt_max)
+        out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=dt_softplus, dt_limit=dt_limit)
         ctx.save_for_backward(out if z is None else out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx)
         ctx.dt_softplus = dt_softplus
         ctx.chunk_size = chunk_size
-        ctx.dt_min = dt_min
-        ctx.dt_max = dt_max
+        ctx.dt_limit = dt_limit
         ctx.return_final_states = return_final_states
         return out if not return_final_states else (out, final_states)
 
@@ -464,13 +538,11 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
     def backward(ctx, dout, *args):
         out, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx = ctx.saved_tensors
         dfinal_states = args[0] if ctx.return_final_states else None
-        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=ctx.dt_softplus, dt_min=ctx.dt_min, dt_max=ctx.dt_max)
+        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=ctx.dt_softplus, dt_limit=ctx.dt_limit)
         return dx, ddt, dA, dB, dC, None, dD, dz, ddt_bias, dinitial_states, None, None, None, None
 
 
-# compiling with graph does not work, even if suggested otherwise
-# https://github.com/state-spaces/mamba/issues/355 + https://github.com/state-spaces/mamba/issues/369
-def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_min=0.0, dt_max=float("inf"), return_final_states=False):
+def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False):
     """
     Argument:
         x: (batch, seqlen, nheads, headdim)
@@ -488,14 +560,184 @@ def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bia
     Return:
         out: (batch, seqlen, nheads, headdim)
     """
-    return MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, dt_softplus, dt_min, dt_max, return_final_states)
+    return MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, dt_softplus, dt_limit, return_final_states)
+
+
+def mamba_chunk_scan(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False):
+    """
+    Argument:
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, seqlen, nheads)
+        A: (nheads)
+        B: (batch, seqlen, ngroups, dstate)
+        C: (batch, seqlen, ngroups, dstate)
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, nheads, headdim)
+        dt_bias: (nheads,)
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+    """
+    batch, seqlen, nheads, headdim = x.shape
+    dstate = B.shape[-1]
+    if seqlen % chunk_size != 0:
+        dt = F.pad(dt, (0, 0, 0, chunk_size - seqlen % chunk_size))
+    dt = rearrange(dt, "b (c l) h -> b h c l", l=chunk_size)
+    dt = dt.float()  # We want high precision for this before cumsum
+    if dt_bias is not None:
+        dt = dt + rearrange(dt_bias, "h -> h 1 1")
+    if dt_softplus:
+        dt = F.softplus(dt)
+    dA = dt * rearrange(A, "h -> h 1 1")
+    dA = dt * rearrange(A, "h -> h 1 1")
+    dA_cumsum = torch.cumsum(dA, dim=-1)
+    # 1. Compute the state for each chunk
+    states = chunk_state(B, x, dt, dA_cumsum, states_in_fp32=True)
+    # 2. Pass the state to all the chunks by weighted cumsum.
+    states = rearrange(state_passing(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])[0],
+                       "... (p n) -> ... p n", n=dstate)
+    # 3. Compute the output for each chunk
+    out = chunk_scan(B, C, x, dt, dA_cumsum, states, D=D, z=z)
+    return out
+
+
+def ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False):
+    """
+    Argument:
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, seqlen, nheads)
+        A: (nheads)
+        B: (batch, seqlen, ngroups, dstate)
+        C: (batch, seqlen, ngroups, dstate)
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, nheads, headdim)
+        dt_bias: (nheads,)
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+    """
+    batch, seqlen, nheads, headdim = x.shape
+    dstate = B.shape[-1]
+    if seqlen % chunk_size != 0:
+        dt = F.pad(dt, (0, 0, 0, chunk_size - seqlen % chunk_size))
+    dt = rearrange(dt, "b (c l) h -> b h c l", l=chunk_size)
+    dt = dt.float()  # We want high precision for this before cumsum
+    if dt_bias is not None:
+        dt = dt + rearrange(dt_bias, "h -> h 1 1")
+    if dt_softplus:
+        dt = F.softplus(dt)
+    dA = dt * rearrange(A, "h -> h 1 1")
+    dA_cumsum = torch.cumsum(dA, dim=-1)
+    # 1. Compute the state for each chunk
+    states = chunk_state_ref(B, x, dt, dA_cumsum)
+    states_dtype = states.dtype
+    if states.dtype not in [torch.float32, torch.float64]:
+        states = states.to(torch.float32)
+    # 2. Pass the state to all the chunks by weighted cumsum.
+    # state_passing_ref is much less numerically stable
+    states = rearrange(state_passing_ref(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])[0],
+                       "... (p n) -> ... p n", n=dstate)
+    states = states.to(states_dtype)
+    # 3. Compute the output for each chunk
+    out = chunk_scan_ref(B, C, x, dt, dA_cumsum, states, D=D, z=z)
+    return out
+
+
+def ssd_selective_scan(x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
+    """
+    Argument:
+        x: (batch, seqlen, nheads, headdim)
+        dt: (batch, seqlen, nheads) or (batch, seqlen, nheads, headdim)
+        A: (nheads) or (dim, dstate)
+        B: (batch, seqlen, ngroups, dstate)
+        C: (batch, seqlen, ngroups, dstate)
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, nheads, headdim)
+        dt_bias: (nheads,) or (nheads, headdim)
+    Return:
+        out: (batch, seqlen, nheads, headdim)
+    """
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+
+    batch, seqlen, nheads, headdim = x.shape
+    _, _, ngroups, dstate = B.shape
+    x = rearrange(x, "b l h p -> b (h p) l")
+    if dt.dim() == 3:
+        dt = repeat(dt, "b l h -> b l h p", p=headdim)
+    dt = rearrange(dt, "b l h p -> b (h p) l")
+    if A.dim() == 1:
+        A = repeat(A, "h -> (h p) n", p=headdim, n=dstate).to(dtype=torch.float32)
+    else:
+        A = A.to(dtype=torch.float32)
+    B = rearrange(B, "b l g n -> b g n l")
+    C = rearrange(C, "b l g n -> b g n l")
+    if D is not None:
+        if D.dim() == 2:
+            D = rearrange(D, "h p -> (h p)")
+        else:
+            D = repeat(D, "h -> (h p)", p=headdim)
+    if z is not None:
+        z = rearrange(z, "b l h p -> b (h p) l")
+    if dt_bias is not None:
+        if dt_bias.dim() == 1:
+            dt_bias = repeat(dt_bias, "h -> h p", p=headdim)
+        dt_bias = rearrange(dt_bias, "h p -> (h p)")
+    if dt_limit != (0.0, float("inf")):
+        if dt_bias is not None:
+            dt = dt + rearrange(dt_bias, "d -> d 1")
+        if dt_softplus:
+            dt = F.softplus(dt)
+        dt = dt.clamp(min=dt_limit[0], max=dt_limit[1]).to(x.dtype)
+        dt_bias = None
+        dt_softplus = None
+    out = selective_scan_fn(x, dt, A, B, C, D=D, z=z, delta_bias=dt_bias, delta_softplus=dt_softplus)
+    return rearrange(out, "b (h p) l -> b l h p", p=headdim)
+
+
+def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=None, z=None,
+                          dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")),
+                          activation="silu", headdim=None, ngroups=1):
+    """
+    Argument:
+        xBC: (batch, seqlen, dim + 2 * ngroups * dstate) where dim == nheads * headdim
+        conv1d_weight: (dim + 2 * ngroups * dstate, width)
+        conv1d_bias: (dim + 2 * ngroups * dstate,)
+        dt: (batch, seqlen, nheads) or (batch, seqlen, nheads, headdim)
+        A: (nheads)
+        D: (nheads, headdim) or (nheads,)
+        z: (batch, seqlen, dim)
+        dt_bias: (nheads) or (nheads, headdim)
+        headdim: if D is 1D and z is None, headdim must be passed in
+    Return:
+        out: (batch, seqlen, dim)
+    """
+    batch, seqlen, nheads = dt.shape[:3]
+    assert nheads % ngroups == 0
+    if z is not None:
+        dim = z.shape[-1]
+        assert dim % nheads == 0
+        headdim = dim // nheads
+    else:
+        if D.dim() == 1:
+            assert headdim is not None
+        else:
+            headdim = D.shape[1]
+        dim = nheads * headdim
+    xBC = rearrange(causal_conv1d_fn(rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation),
+                    "b d s -> b s d")
+    dstate = (xBC.shape[-1] - dim) // ngroups // 2
+    x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+    x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+    B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
+    C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
+    z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
+    out = ssd_selective_scan(x, dt.to(x.dtype), A, B, C, D=D.float(), z=z, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
+    return rearrange(out, "b s h p -> b s (h p)")
 
 
 class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_min=0.0, dt_max=float("inf"), return_final_states=False, activation="silu",
+    def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
                 rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
                 ngroups=1, norm_before_gate=True):
         assert activation in [None, "silu", "swish"]
@@ -526,13 +768,13 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
         if rmsnorm_weight is None:
-            out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_min=dt_min, dt_max=dt_max)
+            out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit)
             out = rearrange(out, "b s h p -> b s (h p)")
             rstd = None
             if d_nonssm > 0:
                 out = torch.cat([_swiglu_fwd(zx0), out], dim=-1)
         else:
-            out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_min=dt_min, dt_max=dt_max)
+            out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit)
             # reshape input data into 2D tensor
             x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
@@ -561,8 +803,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             assert outproj_bias is None
         ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
                               out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
-        ctx.dt_min = dt_min
-        ctx.dt_max = dt_max
+        ctx.dt_limit = dt_limit
         ctx.return_final_states = return_final_states
         ctx.activation = activation
         ctx.rmsnorm_eps = rmsnorm_eps
@@ -617,7 +858,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         if rmsnorm_weight is None:
             dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
             dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_combined_bwd(
-                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_min=ctx.dt_min, dt_max=ctx.dt_max, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output
+                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output
             )
             out_for_linear = rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
             drmsnorm_weight = None
@@ -632,7 +873,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             out_for_linear = out_recompute if recompute_output else None
             dout = rearrange(dout, "(b s) (h p) -> b s h p", b=batch, p=headdim)
             dx, ddt, dA, dB, dC, dD, _, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
-                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_min=ctx.dt_min, dt_max=ctx.dt_max, dx=dx, ddt=ddt_given, dB=dB, dC=dC
+                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC
             )
 
         if outproj_weight is not None:
@@ -649,7 +890,7 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None
 
 
-def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_min=0.0, dt_max=float("inf"), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
+def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
     """
     Argument:
         zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
@@ -668,4 +909,54 @@ def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias
     Return:
         out: (batch, seqlen, dim)
     """
-    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_min, dt_max, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate)
+    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate)
+
+
+def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, dt_limit=(0.0, float("inf")), activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
+    """
+    Argument:
+        zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
+        conv1d_weight: (dim + 2 * ngroups * dstate, width)
+        conv1d_bias: (dim + 2 * ngroups * dstate,)
+        dt_bias: (nheads,)
+        A: (nheads)
+        D: (nheads, headdim) or (nheads,)
+        rmsnorm_weight: (dim,)
+        outproj_weight: (out_dim, dim)
+        outproj_bias: (out_dim,)
+        headdim: if D is 1D, headdim must be passed in
+        norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
+    Return:
+        out: (batch, seqlen, dim)
+    """
+    if D.dim() == 1:
+        assert headdim is not None
+        nheads, = D.shape
+    else:
+        nheads, headdim = D.shape
+    assert nheads % ngroups == 0
+    batch, seqlen, _ = zxbcdt.shape
+    dim = nheads * headdim
+    dstate = (zxbcdt.shape[-1] - 2 * dim - nheads) // ngroups // 2
+    assert zxbcdt.shape == (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads)
+    assert dt_bias.shape == (nheads,)
+    assert A.shape == (nheads,)
+    if rmsnorm_weight is not None:
+        assert rmsnorm_weight.shape == (dim,)
+    z, xBC, dt = torch.split(zxbcdt, [dim, dim + 2 * ngroups * dstate, nheads], dim=-1)
+    xBC = rearrange(causal_conv1d_fn(rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation),
+                    "b d s -> b s d")
+    x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+    x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+    B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
+    C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
+    z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
+    out = ssd_selective_scan(x, dt.to(x.dtype), A, B, C, D=D.float(),
+                             z=z if rmsnorm_weight is None else None, dt_bias=dt_bias, dt_softplus=True, dt_limit=dt_limit)
+    out = rearrange(out, "b s h p -> b s (h p)")
+    if rmsnorm_weight is not None:
+        out = rmsnorm_fn(out, rmsnorm_weight, None, z=rearrange(z, "b l h p -> b l (h p)"), eps=rmsnorm_eps,
+                         norm_before_gate=norm_before_gate)
+    if outproj_weight is not None:
+        out = F.linear(out, outproj_weight, outproj_bias)
+    return out
