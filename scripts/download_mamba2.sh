@@ -19,19 +19,14 @@ if [ "$is_valid" = false ] ; then
 fi
 
 
-echo "Converting mamba2-$1"
-echo "Saving results to $2/mamba-$1"
+echo "Downloading mamba2-$1"
+echo "Saving to $2/mamba2-$1"
 echo ""
 
-# lfs is needed for the torch bin file(s)
+# lfs is needed for the safetensors
 git lfs install
 # pass parameter variant as arg
-git clone "https://huggingface.co/state-spaces/mamba2-$1"
-echo ""
-
-# converting and removing the old stuff
-python convert_mamba2_to_hf.py --input_ssm_dir "mamba2-$1" --output_dir "$2"
-rm -rf "mamba2-$1"
+git clone "https://huggingface.co/AntonV/mamba2-$1-av" "$2/mamba2-$1"
 echo ""
 
 echo "Finished!"

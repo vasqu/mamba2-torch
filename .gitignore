@@ -319,4 +319,4 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/python,pycharm+all,intellij+all
 
 # local checkpoints that I've ported
-src/mamba2_torch/ssm_ckpts/
+models/
