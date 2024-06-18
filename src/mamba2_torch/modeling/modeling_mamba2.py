@@ -319,7 +319,7 @@ class Mamba2Mixer(nn.Module):
             self, x, B, C, dt, initial_state, return_final_state, use_triton_kernels, cache, cached_start, cached_forward
     ):
         # Discretize 1-SS(a)
-        A = -torch.exp(self.A_log) if not cached_forward else -torch.exp(self.A_log.float())
+        A = -torch.exp(self.A_log.float())  # .float() to avoid infs/nans
 
         last_state = None
         if not cached_forward:

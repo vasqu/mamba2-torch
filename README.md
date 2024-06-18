@@ -137,14 +137,14 @@ out = model(input_ids, initial_states=initial_states)
 ## Some (Maybe Interesting) Notes
 - Most work goes to the original [mamba repo](https://github.com/state-spaces/mamba). They did the heavy work, give them your flowers.
 - [ssd_minimal](./tests/ssd_minimal.py) is a small script based on the original script provided by Tri Dao and Albert Gu (see [here](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/modules/ssd_minimal.py)) and modified to work on any sequence length and with the `D` residual connection. A small test that checks roughly equal outputs is [over here](./tests/TestSSDMinimal.py).
-- Possible [AMD support](https://github.com/state-spaces/mamba/pull/359) is in the works.
+- [AMD support](https://github.com/state-spaces/mamba/pull/359) has been added as of v2.1.0 of `mamba_ssm`. It should work with the triton kernels here as well.
 - To properly utilize caching, you will need (at least) the pinned version in the [requirements.txt](requirements.txt) of the transformers library.
 - Some optional parallelization options introduced in the original mamba2 repo have been left out:
     - Groups in Multi-input SSM
     - Parallelized linear layers
     - Imo insignificant kernels (e.g. RMSNorm)
 - There are still some issues I'm not so sure of myself:
-    - [Compiling](https://github.com/vasqu/mamba2-torch/issues/1#issue-2349175830) doesn't seem to work on my end which would boost the performance of triton kernels even more.
+    - [Compiling](https://github.com/vasqu/mamba2-torch/issues/1#issue-2349175830) doesn't seem to work on my end which would boost the performance of triton kernels even more. Speed possibly picks up after the first iteration(s), see this [comment](https://github.com/state-spaces/mamba/issues/389#issuecomment-2171755306).
     - [NaN losses](https://github.com/vasqu/mamba2-torch/issues/2#issue-2349255152) seem to be fixed but you have to make sure that `( (d_model * expand) / headdim ) % 8 == 0`.
     - `tie_embedding_weights` flag in the config is probably enforced in any case. Not too interested in digging into this but open for PRs.
 
