@@ -150,8 +150,11 @@ config.max_sequence_chunk = 2
 model = Mamba2ForCausalLM.from_pretrained(mamba2_hf_path, config=config, local_files_only=True).to(device)
 tokenizer = AutoTokenizer.from_pretrained(mamba2_hf_path, local_files_only=True)
 
-input_ids = tokenizer("Hey how are you doing?", return_tensors="pt")["input_ids"].to(device) 
-out = model(input_ids)
+input_ids = tokenizer("Hey how are you doing?", return_tensors="pt")["input_ids"].to(device)
+
+# expected output (130m): `["Hey how are you doing?\n\nI'm in the middle of a project"]`
+out = model.generate(input_ids, max_new_tokens=10)
+print(tokenizer.batch_decode(out))
 ```
 
 
