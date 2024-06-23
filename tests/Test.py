@@ -14,5 +14,5 @@ tokenizer = AutoTokenizer.from_pretrained(mamba2_hf_path, local_files_only=True)
 
 input_ids = tokenizer("Hey how are you doing?", return_tensors="pt")["input_ids"].to(device)
 
-out = model.generate(input_ids, max_new_tokens=10, use_cache=True)
+out = model.generate(input_ids, max_new_tokens=10, use_cache=False)
 print(tokenizer.batch_decode(out))

@@ -365,10 +365,9 @@ class Mamba2Mixer(nn.Module):
                         dt_max=self.dt_max,
                         return_final_states=tmp_return_final_state,
                     )
-
                 if tmp_return_final_state:
                     y, initial_state = y
-                    y_total = y if y_total is None else torch.cat((y_total, y), dim=1)
+                y_total = y if y_total is None else torch.cat((y_total, y), dim=1)
 
             if cached_start or return_final_state:
                 last_state = initial_state
