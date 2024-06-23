@@ -37,3 +37,8 @@ print(torch.allclose(y_2, y_min_2, atol=0.1, rtol=0.1))
 print(torch.allclose(y_2, y_min_2, atol=0.01, rtol=0.01))
 print(torch.allclose(y, y_min, atol=0.1, rtol=0.1))
 print(torch.allclose(y, y_min, atol=0.01, rtol=0.01))
+
+
+y_3_p1, l_3 = mamba_chunk_scan_combined(x[:, :50, :, :], dt[:, :50, :], A, B[:, :50, :, :], C[:, :50, :, :], chunk_size, D=D, initial_states=initial_state, return_final_states=True)
+y_3_p2, _ = mamba_chunk_scan_combined(x[:, 50:, :, :], dt[:, 50:, :], A, B[:, 50:, :, :], C[:, 50:, :, :], chunk_size, D=D, initial_states=l_3, return_final_states=True)
+print(torch.allclose(torch.cat((y_3_p1, y_3_p2), dim=1), y, atol=0.01, rtol=0.01))

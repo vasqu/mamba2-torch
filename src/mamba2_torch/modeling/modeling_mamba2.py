@@ -141,6 +141,7 @@ class Mamba2Mixer(nn.Module):
         self.use_bias = config.use_bias
         self.use_conv_bias = config.use_conv_bias
         self.use_triton_kernels = config.use_triton_kernels
+        self.max_sequence_chunk = config.max_sequence_chunk
 
         # Parallel projection of the input hidden states
         self.in_proj = nn.Linear(
@@ -323,43 +324,58 @@ class Mamba2Mixer(nn.Module):
 
         last_state = None
         if not cached_forward:
-            if use_triton_kernels:
-                y = mamba_chunk_scan_combined(
-                    x=rearrange(x, pattern="b l (h p) -> b l h p", p=self.head_dim),
-                    dt=dt,
-                    A=A,
-                    B=rearrange(B, pattern="b l n -> b l 1 n"),
-                    C=rearrange(C, pattern="b l n -> b l 1 n"),
-                    chunk_size=self.chunk_size,
-                    D=self.D,
-                    z=None,
-                    initial_states=initial_state,
-                    dt_bias=self.dt_bias,
-                    dt_softplus=True,
-                    seq_idx=None,
-                    dt_limit=(self.dt_min, self.dt_max),
-                    return_final_states=cached_start or return_final_state,
-                )
-            else:
-                initial_state = rearrange(initial_state, "b n h p -> b 1 n h p") if initial_state is not None else None
-                y = self._ssd_naive(
-                    x=rearrange(x, pattern="b l (h p) -> b l h p", p=self.head_dim),
-                    dt=dt,
-                    A=A,
-                    B=rearrange(B, pattern="b l n -> b l 1 n"),
-                    C=rearrange(C, pattern="b l n -> b l 1 n"),
-                    chunk_size=self.chunk_size,
-                    initial_states=initial_state,
-                    dt_min=self.dt_min,
-                    dt_max=self.dt_max,
-                    return_final_states=cached_start or return_final_state,
-                )
+            # chunking the sequence forces chunks of all respective variables
+            chunked_vars = list(zip(*[torch.split(t, self.max_sequence_chunk, dim=1) for t in [x, dt, B, C]]))
+            last_chunk_idx = len(chunked_vars) - 1
+
+            # reconstructing y via subsequent concatenations == y_total
+            y_total = None
+            for chunk_idx, (x_chunk, dt_chunk, B_chunk, C_chunk) in enumerate(chunked_vars):
+                # we need the last state when chunking
+                tmp_return_final_state = cached_start or return_final_state if last_chunk_idx == chunk_idx else True
+
+                if use_triton_kernels:
+                    y = mamba_chunk_scan_combined(
+                        x=rearrange(x_chunk, pattern="b l (h p) -> b l h p", p=self.head_dim),
+                        dt=dt_chunk,
+                        A=A,
+                        B=rearrange(B_chunk, pattern="b l n -> b l 1 n"),
+                        C=rearrange(C_chunk, pattern="b l n -> b l 1 n"),
+                        chunk_size=self.chunk_size,
+                        D=self.D,
+                        z=None,
+                        initial_states=initial_state,
+                        dt_bias=self.dt_bias,
+                        dt_softplus=True,
+                        seq_idx=None,
+                        dt_limit=(self.dt_min, self.dt_max),
+                        return_final_states=tmp_return_final_state,
+                    )
+                else:
+                    initial_state = rearrange(initial_state, "b n h p -> b 1 n h p") if initial_state is not None else None
+                    y = self._ssd_naive(
+                        x=rearrange(x_chunk, pattern="b l (h p) -> b l h p", p=self.head_dim),
+                        dt=dt_chunk,
+                        A=A,
+                        B=rearrange(B_chunk, pattern="b l n -> b l 1 n"),
+                        C=rearrange(C_chunk, pattern="b l n -> b l 1 n"),
+                        chunk_size=self.chunk_size,
+                        initial_states=initial_state,
+                        dt_min=self.dt_min,
+                        dt_max=self.dt_max,
+                        return_final_states=tmp_return_final_state,
+                    )
+
+                if tmp_return_final_state:
+                    y, initial_state = y
+                    y_total = y if y_total is None else torch.cat((y_total, y), dim=1)
+
             if cached_start or return_final_state:
-                y, last_state = y
+                last_state = initial_state
                 if cached_start:
                     cache.ssm_states[self.layer_idx].copy_(last_state)
 
-            y = rearrange(y, "b l h p -> b l (h p)")
+            y = rearrange(y_total, "b l h p -> b l (h p)")
         else:
             if use_triton_kernels:
                 # Preparing values for single step
@@ -438,7 +454,7 @@ class Mamba2Mixer(nn.Module):
         zxbcdt = self.in_proj(hidden_states)
 
         # 2-5. Training combined into one triton kernel
-        if self.training and cache is None and is_fast_path_available and use_triton_kernels:
+        if self.training and cache is None and hidden_states.shape[1] <= self.max_sequence_chunk and is_fast_path_available and use_triton_kernels:
             y = mamba_split_conv1d_scan_combined(
                 zxbcdt=zxbcdt,
                 conv1d_weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),

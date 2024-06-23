@@ -38,6 +38,8 @@ class Mamba2Config(PretrainedConfig):
             Size of the convolution kernel.
         num_hidden_layers (`int`, *optional*, defaults to 32):
             Number of hidden layers in the model.
+        max_sequence_chunk (`int`, *optional*, defaults to 2048):
+            Max size of a sequence chunk processed at once during a SSD block.
         layer_norm_epsilon (`float`, *optional*, defaults to 1e-05):
             The epsilon to use in the layer normalization layers.
         use_bias (`bool`, *optional*, defaults to `False`):
@@ -89,6 +91,7 @@ class Mamba2Config(PretrainedConfig):
             expand=2,
             conv_kernel=4,
             num_hidden_layers=24,
+            max_sequence_chunk=2048,
             layer_norm_epsilon=1e-5,
             use_bias=False,
             use_conv_bias=True,
@@ -121,6 +124,7 @@ class Mamba2Config(PretrainedConfig):
         self.intermediate_size = int(expand * self.hidden_size)
         self.num_heads = self.intermediate_size // self.head_dim
         self.num_hidden_layers = num_hidden_layers
+        self.max_sequence_chunk = max_sequence_chunk
         self.layer_norm_epsilon = layer_norm_epsilon
         self.use_bias = use_bias
         self.use_conv_bias = use_conv_bias
