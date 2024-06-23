@@ -32,7 +32,7 @@ To use the "fastest" path, you need to install the [causal-conv1d](https://githu
 ## Usage
 ### Basics
 To use any pretrained `Mamba2` model you need a compatible format of the respective model. You have two options:
-- Download a converted model from the huggingface hub via this [download script](./scripts/download_mamba2.sh).
+- Download a converted model from the huggingface hub via this [download script](./scripts/download_mamba2.sh) ([main branch](https://github.com/vasqu/mamba2-torch/tree/main) only).
 ```bash
 # example usage to download mamba2-130m
 # 1st argument = parameter count, 2nd argument = directory to save the converted model to
@@ -68,6 +68,7 @@ Some optional features to give more control over the model:
 - [Disabling/Enabling Triton Kernels](#disablingenabling-triton-kernels)
 - [Outputting The Last SSM States](#outputting-the-last-ssm-states)
 - [Passing Initial States](#passing-initial-states)
+- [Chunked Forward (Branch Exclusive Feature)](#chunked-forward-branch-exclusive-feature)
 
 #### Disabling/Enabling Triton Kernels
 ```python
@@ -131,6 +132,26 @@ initial_states[4] = None
 
 # pass it in the forward call 
 out = model(input_ids, initial_states=initial_states)
+```
+
+#### Chunked Forward (Branch Exclusive Feature)
+ ```python
+from transformers import AutoTokenizer
+from mamba2_torch import Mamba2Model, Mamba2ForCausalLM, Mamba2Config
+
+device = "cuda"
+mamba2_hf_path = "<path-to-converted-model>"
+
+# `max_sequence_chunk` will limit the max sequence length processed at once during the SSD block
+# inspired by section 8.2 of the mamba2 paper and transformer-xl (https://arxiv.org/pdf/1901.02860)
+config = Mamba2Config.from_pretrained(mamba2_hf_path, local_files_only=True)
+config.max_sequence_chunk = 2
+
+model = Mamba2ForCausalLM.from_pretrained(mamba2_hf_path, config=config, local_files_only=True).to(device)
+tokenizer = AutoTokenizer.from_pretrained(mamba2_hf_path, local_files_only=True)
+
+input_ids = tokenizer("Hey how are you doing?", return_tensors="pt")["input_ids"].to(device) 
+out = model(input_ids)
 ```
 
 
