@@ -41,7 +41,7 @@ def ssd_minimal_discrete(X, dt, A, B, C, block_len, D=None, initial_states=None)
 
     # (Optional) D skip connection preparing
     if D is not None:
-        skip = rearrange(D, "h -> 1 1 h 1") * pad_by_size(X, pad_size)
+        skip = D.unsqueeze(-1) * pad_by_size(X, pad_size)
 
     # Discretize X and A
     X = X * dt.unsqueeze(-1)

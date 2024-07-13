@@ -263,11 +263,11 @@ class Mamba2Mixer(nn.Module):
         dt = nn.functional.softplus(dt + self.dt_bias)
         dt = torch.clamp(dt, dt_min, dt_max)
 
-        D_residual = rearrange(self.D, "h -> 1 1 h 1") * pad_by_size(x, pad_size)
+        D_residual = self.D.unsqueeze(-1) * pad_by_size(x, pad_size)
 
         # Discretize x and A
         x = x * dt.unsqueeze(-1)
-        A = A * dt
+        A = A.to(x.dtype) * dt
 
         # Rearrange into blocks/chunks
         x, A, B, C = [
