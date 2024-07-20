@@ -13,7 +13,7 @@ config.use_triton_kernels = False
 model = Mamba2ForCausalLM.from_pretrained(mamba2_hf_path, config=config, local_files_only=True).to(device, dtype=dtype)
 tokenizer = AutoTokenizer.from_pretrained(mamba2_hf_path, local_files_only=True)
 
-input_ids = tokenizer("Hey how are you doing?", return_tensors="pt")["input_ids"].to(device)
+input_ids = tokenizer(["Hey how are you doing?", "What is life?"], padding=True, return_tensors="pt")["input_ids"].to(device)
 
 out = model.generate(input_ids, max_new_tokens=10, use_cache=True)
 print(tokenizer.batch_decode(out))

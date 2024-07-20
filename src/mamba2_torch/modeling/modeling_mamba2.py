@@ -188,7 +188,7 @@ class Mamba2Mixer(nn.Module):
         if is_fast_path_available and use_triton_kernels:
             if cached_forward:
                 xBC = causal_conv1d_update(
-                    xBC,
+                    xBC.squeeze(1),
                     cache.conv_states[self.layer_idx],
                     rearrange(self.conv1d.weight, "d 1 w -> d w"),
                     self.conv1d.bias,
@@ -206,7 +206,7 @@ class Mamba2Mixer(nn.Module):
                 cache.conv_states[self.layer_idx].copy_(
                     torch.roll(cache.conv_states[self.layer_idx], shifts=-1, dims=-1)
                 )
-                cache.conv_states[self.layer_idx][:, :, -1] = xBC
+                cache.conv_states[self.layer_idx][:, :, -1] = xBC.squeeze(1)
                 xBC = torch.sum(
                     cache.conv_states[self.layer_idx] * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
                 )
