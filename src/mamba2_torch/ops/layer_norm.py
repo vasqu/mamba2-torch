@@ -11,10 +11,10 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import custom_fwd, custom_bwd
-
 import triton
 import triton.language as tl
+
+from ..ops.custom_fwd_bwd import custom_fwd, custom_bwd
 
 
 def layer_norm_ref(
