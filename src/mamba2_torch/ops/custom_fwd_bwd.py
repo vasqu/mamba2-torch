@@ -7,12 +7,12 @@ def custom_amp_decorator(dec, cuda_amp_deprecated):
     return decorator
 
 
-if hasattr(torch.cuda.amp, "custom_fwd"):
-    deprecated = False
-    from torch.cuda.amp import custom_fwd, custom_bwd
-else:
+if hasattr(torch.amp, "custom_fwd"):
     deprecated = True
     from torch.amp import custom_fwd, custom_bwd
+else:
+    deprecated = False
+    from torch.cuda.amp import custom_fwd, custom_bwd
 
 custom_fwd = custom_amp_decorator(custom_fwd, deprecated)
 custom_bwd = custom_amp_decorator(custom_bwd, deprecated)
