@@ -34,3 +34,17 @@ y_min_2, _ = ssd_minimal_discrete(x, dt, A, B, C, chunk_size, D=None, initial_st
 print(torch.allclose(l, l_min, atol=0.01, rtol=0.01))
 print(torch.allclose(y, y_min, atol=0.01, rtol=0.01))
 print(torch.allclose(y_2, y_min_2, atol=0.01, rtol=0.01))
+
+
+# very messy lmao
+t = 50
+y1, l1 = mamba_chunk_scan_combined(x[:, :t, :, :], dt[:, :t, :], A, B[:, :t, :, :], C[:, :t, :, :], chunk_size, D=D, initial_states=initial_state, return_final_states=True)
+
+attention_mask = torch.ones(size=(batch, seqlen)).to(device, dtype=torch.int64)
+attention_mask[:, t:] = 0
+attention_mask_1 = attention_mask[:, :, None]
+attention_mask_2 = attention_mask[:, :, None, None]
+y2, l2 = mamba_chunk_scan_combined(x * attention_mask_2, dt * attention_mask_1, A, B * attention_mask_2, C * attention_mask_2, chunk_size, D=D, initial_states=initial_state, return_final_states=True)
+
+print(torch.allclose(y1, y2[:, :t, :], atol=0.01, rtol=0.01))
+print(torch.allclose(l1, l2, atol=0.01, rtol=0.01))
