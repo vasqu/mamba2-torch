@@ -316,7 +316,7 @@ class Mamba2Mixer(nn.Module):
             return y, final_state
 
     def _ssd(
-            self, x, B, C, dt, initial_state, return_final_state, use_triton_kernels, cache, cached_start, cached_forward
+        self, x, B, C, dt, initial_state, return_final_state, use_triton_kernels, cache, cached_start, cached_forward
     ):
         # Discretize 1-SS(a)
         A = -torch.exp(self.A_log.float())  # .float() to avoid infs/nans
@@ -415,12 +415,13 @@ class Mamba2Mixer(nn.Module):
         return y, last_state
 
     def _forward(
-            self,
-            hidden_states,
-            use_triton_kernels,
-            initial_state=None,
-            return_final_state=False,
-            cache: Optional[Mamba2Cache] = None,
+        self,
+        hidden_states,
+        use_triton_kernels,
+        initial_state=None,
+        return_final_state=False,
+        cache: Optional[Mamba2Cache] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
     ):
         # Managing cache state
         if cache is not None:
@@ -433,6 +434,9 @@ class Mamba2Mixer(nn.Module):
         # Supporting cached values as well as passing initial states but not both at the same time
         if initial_state is not None and cached_forward:
             raise ValueError("Subsequent caching and passing initial states is not possible at the same time!")
+
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask[:, :, None]
 
         # 1. Parallel projection for the input
         zxbcdt = self.in_proj(hidden_states)
@@ -483,6 +487,9 @@ class Mamba2Mixer(nn.Module):
             cached_forward=cached_forward,
         )
 
+        if attention_mask is not None:
+            xBC = xBC * attention_mask[:, :, None]
+
         # Reconstruct causal convolution vars
         x, B, C = torch.split(xBC, [self.intermediate_size, self.ssm_state_size, self.ssm_state_size], dim=-1)
 
@@ -511,7 +518,12 @@ class Mamba2Mixer(nn.Module):
         return y, last_state
 
     def forward(
-            self, hidden_states, initial_state=None, return_final_state=False, cache: Optional[Mamba2Cache] = None
+        self,
+        hidden_states,
+        initial_state=None,
+        return_final_state=False,
+        cache: Optional[Mamba2Cache] = None,
+        attention_mask=None,
     ):
         use_triton_kernels = "cuda" in self.in_proj.weight.device.type and self.use_triton_kernels
 
@@ -527,7 +539,7 @@ class Mamba2Mixer(nn.Module):
                 "Fast path is not available because the GPU is not properly utilized. "
                 "Falling back to naive implementation."
             )
-        return self._forward(hidden_states, use_triton_kernels, initial_state, return_final_state, cache)
+        return self._forward(hidden_states, use_triton_kernels, initial_state, return_final_state, cache, attention_mask)
 
 
 class Mamba2RMSNorm(nn.Module):
@@ -565,7 +577,12 @@ class Mamba2Block(nn.Module):
         self.mixer = Mamba2Mixer(config, layer_idx=layer_idx)
 
     def forward(
-            self, hidden_states, initial_state=None, return_final_state=False, cache: Optional[Mamba2Cache] = None
+        self,
+        hidden_states,
+        initial_state=None,
+        return_final_state=False,
+        cache: Optional[Mamba2Cache] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
     ):
         residual = hidden_states
         hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
@@ -573,7 +590,11 @@ class Mamba2Block(nn.Module):
             residual = residual.to(torch.float32)
 
         hidden_states, last_state = self.mixer(
-            hidden_states, initial_state=initial_state, return_final_state=return_final_state, cache=cache
+            hidden_states,
+            initial_state=initial_state,
+            return_final_state=return_final_state,
+            cache=cache,
+            attention_mask=attention_mask
         )
         hidden_states = residual + hidden_states
         return hidden_states, last_state
@@ -635,16 +656,16 @@ class Mamba2Model(Mamba2PreTrainedModel):
         self.embeddings = new_embeddings
 
     def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            inputs_embeds: Optional[torch.LongTensor] = None,
-            cache_params: Optional[Mamba2Cache] = None,
-            use_cache: Optional[bool] = None,
-            initial_states: Optional[List[torch.FloatTensor]] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_last_ssm_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            **kwargs,  # `attention_mask` is passed by the tokenizer and we don't want it
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.LongTensor] = None,
+        cache_params: Optional[Mamba2Cache] = None,
+        use_cache: Optional[bool] = None,
+        initial_states: Optional[List[torch.FloatTensor]] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_last_ssm_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, Mamba2Output]:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -684,7 +705,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
         for mixer_block, initial_state in zip(self.layers, initial_states):
             if self.gradient_checkpointing and self.training:
                 out = self._gradient_checkpointing_func(
-                    mixer_block.__call__, hidden_states, initial_state, output_last_ssm_states, cache_params
+                    mixer_block.__call__, hidden_states, initial_state, output_last_ssm_states, cache_params, attention_mask
                 )
             else:
                 out = mixer_block(
@@ -692,6 +713,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
                     initial_state=initial_state,
                     return_final_state=output_last_ssm_states,
                     cache=cache_params,
+                    attention_mask=attention_mask,
                 )
 
             hidden_states = out[0]
@@ -783,48 +805,89 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel):
         return self.backbone.set_input_embeddings(new_embeddings)
 
     def _update_model_kwargs_for_generation(
-            self, outputs: ModelOutput, model_kwargs: Dict[str, Any], **kwargs
+            self, outputs: ModelOutput, model_kwargs: Dict[str, Any], num_new_tokens: int = 1, **kwargs
     ) -> Dict[str, Any]:
         model_kwargs["cache_params"] = outputs.get("cache_params", None)
+
+        if (
+                model_kwargs.get("use_cache", True)
+                and "cache_position" in model_kwargs
+                and model_kwargs["cache_position"] is not None
+        ):
+            model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + num_new_tokens
+
+        if "attention_mask" in model_kwargs:
+            attention_mask = model_kwargs["attention_mask"]
+            model_kwargs["attention_mask"] = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+            )
+
         return model_kwargs
 
     def prepare_inputs_for_generation(
-            self,
-            input_ids,
-            inputs_embeds=None,
-            use_cache=None,
-            cache_params: Optional[Mamba2Cache] = None,
-            **kwargs,
+        self,
+        input_ids,
+        inputs_embeds=None,
+        use_cache=None,
+        cache_params: Optional[Mamba2Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        **kwargs,
     ):
+        if use_cache:
+            # `cache_position` should have been initialized in `generate`
+            if cache_position is None:
+                raise ValueError(
+                    "`cache_position` should not be None as it should have been initialized in "
+                    "`model.generate`, you are responsible for passing in a valid `cache_position` if "
+                    "you are calling `prepare_inputs_for_generation` directly with `use_cache=True`"
+                )
+            # only last token for inputs_ids if the state is passed along.
+            if cache_position[0] > 0:
+                input_ids = input_ids[:, -1].unsqueeze(-1)
+
+                # in a cached forward we do not care about padding anymore
+                if attention_mask is not None:
+                    attention_mask = None
+            else:
+                # we initialize the `cache_position` to full size of `conv_states` at prefill stage
+                # considering padding will be applied when input length is shorter, and truncation
+                # will be applied when it is longer, so it will be equivalent to always have it match
+                # the length of `cache_params.conv_states`, which is `config.conv_kernel`
+                cache_position = torch.arange(0, self.config.conv_kernel, device=input_ids.device)
+
         # only last token for inputs_ids if the state is passed along.
         if cache_params is not None:
             input_ids = input_ids[:, -1].unsqueeze(-1)
 
         if inputs_embeds is not None and cache_params is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
+            model_inputs = {"inputs_embeds": inputs_embeds.contiguous()}
         else:
-            model_inputs = {"input_ids": input_ids}
+            model_inputs = {"input_ids": input_ids.contiguous()}
 
         model_inputs.update(
             {
                 "cache_params": cache_params,
                 "use_cache": use_cache,
+                "cache_position": cache_position,
+                "attention_mask": attention_mask,
             }
         )
         return model_inputs
 
     def forward(
-            self,
-            input_ids: Optional[torch.LongTensor] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            cache_params: Optional[Mamba2Cache] = None,
-            initial_states: Optional[List[torch.FloatTensor]] = None,
-            labels: Optional[torch.LongTensor] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_last_ssm_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            use_cache: Optional[bool] = None,
-            **kwargs,  # for now we need this for generation
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        cache_params: Optional[Mamba2Cache] = None,
+        initial_states: Optional[List[torch.FloatTensor]] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_last_ssm_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        use_cache: Optional[bool] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        **kwargs,  # for now we need this for generation
     ) -> Union[Tuple, Mamba2CausalLMOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -843,6 +906,7 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel):
             output_hidden_states=output_hidden_states,
             output_last_ssm_states=output_last_ssm_states,
             return_dict=return_dict,
+            attention_mask=attention_mask,
         )
         hidden_states = mamba_outputs[0]
 
