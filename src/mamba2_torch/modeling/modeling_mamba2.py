@@ -257,7 +257,7 @@ class Mamba2Mixer(nn.Module):
 
         # Since it is parallelized by chunks they have to be of the same size which we ensure by padding
         seq_len = x.shape[1]
-        pad_size = chunk_size - (seq_len % chunk_size)
+        pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
 
         # dt softplus and clamping
         dt = nn.functional.softplus(dt + self.dt_bias)
